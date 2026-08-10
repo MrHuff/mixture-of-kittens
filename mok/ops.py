@@ -38,8 +38,8 @@ def all_gather_top_experts(
     if any(size <= 0 for size in all_gather_top_experts_buffer.shape):
         raise ValueError("all_gather_top_experts_buffer dimensions must be positive")
     ep_size = all_gather_top_experts_buffer.shape[0]
-    if ep_size not in (4, 8, 16, 32, 64):
-        raise ValueError("all_gather_top_experts_buffer ep_size must be one of 4, 8, 16, 32, 64")
+    if ep_size not in (2, 4, 8, 16, 32, 64):
+        raise ValueError("all_gather_top_experts_buffer ep_size must be one of 2, 4, 8, 16, 32, 64")
     if (all_gather_top_experts_buffer.device != top_experts.device
             or tuple(all_gather_top_experts_buffer.shape[1:]) != tuple(top_experts.shape)):
         raise ValueError("all_gather_top_experts_buffer must match top_experts shape and device")
@@ -88,8 +88,8 @@ def barrier_all(
         type(pointer) is not int or pointer <= 0 for pointer in barrier_buffer_ptrs):
         raise TypeError("barrier_buffer_ptrs must be a list of positive integers")
     ep_size = len(barrier_buffer_ptrs)
-    if ep_size not in (4, 8, 16, 32, 64):
-        raise ValueError("barrier_buffer_ptrs length must be one of 4, 8, 16, 32, 64")
+    if ep_size not in (2, 4, 8, 16, 32, 64):
+        raise ValueError("barrier_buffer_ptrs length must be one of 2, 4, 8, 16, 32, 64")
     if type(barrier_buffer_multicast_ptr) is not int or barrier_buffer_multicast_ptr <= 0:
         raise TypeError("barrier_buffer_multicast_ptr must be a positive integer")
     if (not target.is_cuda or target.device != barrier_buffer.device
@@ -129,8 +129,8 @@ def schedule(
     if topk_all.ndim != 3:
         raise ValueError("topk_all must have shape (ep_size, num_local_tokens, topk)")
     ep_size, num_local_tokens, topk = topk_all.shape
-    if ep_size not in (4, 8, 16, 32, 64):
-        raise ValueError("topk_all ep_size must be one of 4, 8, 16, 32, 64")
+    if ep_size not in (2, 4, 8, 16, 32, 64):
+        raise ValueError("topk_all ep_size must be one of 2, 4, 8, 16, 32, 64")
     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
         raise ValueError(
             "topk_all num_local_tokens must be at least 512 and divisible by 256"
@@ -189,6 +189,254 @@ def mxfp8_quantize(
         raise ValueError("at least one quantized layout must be requested")
 
     return _C.mxfp8_quantize(x_bf16, return_normal, return_transposed)
+
+
+def _validate_fp4_dispatch(
+    x: torch.Tensor,
+    x_ptrs: list[int],
+    schedule_peer_rank: torch.Tensor,
+    schedule_peer_token_idx: torch.Tensor,
+    num_tokens: torch.Tensor,
+    topk: int,
+    num_comm_sms: int,
+) -> None:
+    if (not x.is_cuda or x.dtype != torch.bfloat16 or not x.is_contiguous()
+            or x.ndim != 2):
+        raise ValueError("x must be contiguous CUDA bfloat16 [tokens, hidden]")
+    if x.shape[0] < 512 or x.shape[0] % 256:
+        raise ValueError("x token count must be at least 512 and divisible by 256")
+    if x.shape[1] <= 0 or x.shape[1] % 128:
+        raise ValueError("x hidden size must be positive and divisible by 128")
+    if (not isinstance(x_ptrs, list) or len(x_ptrs) not in (2, 4, 8, 16, 32, 64)
+            or any(type(pointer) is not int or pointer <= 0 for pointer in x_ptrs)):
+        raise ValueError("x_ptrs must contain positive pointers for 2, 4, 8, 16, 32, or 64 peers")
+    if (not schedule_peer_rank.is_cuda or schedule_peer_rank.device != x.device
+            or schedule_peer_rank.dtype != torch.int32
+            or not schedule_peer_rank.is_contiguous() or schedule_peer_rank.ndim != 1
+            or schedule_peer_rank.numel() == 0 or schedule_peer_rank.numel() % 128):
+        raise ValueError("schedule_peer_rank must be contiguous CUDA int32 with 128-aligned capacity")
+    if (not schedule_peer_token_idx.is_cuda or schedule_peer_token_idx.device != x.device
+            or schedule_peer_token_idx.dtype != torch.int32
+            or not schedule_peer_token_idx.is_contiguous()
+            or schedule_peer_token_idx.shape != schedule_peer_rank.shape):
+        raise ValueError("schedule_peer_token_idx must match schedule_peer_rank")
+    if (not num_tokens.is_cuda or num_tokens.device != x.device
+            or num_tokens.dtype != torch.int32 or not num_tokens.is_contiguous()
+            or tuple(num_tokens.shape) != (1,)):
+        raise ValueError("num_tokens must be contiguous CUDA int32 [1]")
+    if type(topk) is not int or not 0 < topk <= 255:
+        raise ValueError("topk must be an integer in [1, 255]")
+    if type(num_comm_sms) is not int or num_comm_sms <= 0:
+        raise ValueError("num_comm_sms must be a positive integer")
+
+
+@torch.library.custom_op("mok::dispatch_mxfp4", mutates_args=())
+def dispatch_mxfp4(
+    x: torch.Tensor,
+    x_ptrs: list[int],
+    schedule_peer_rank: torch.Tensor,
+    schedule_peer_token_idx: torch.Tensor,
+    num_tokens: torch.Tensor,
+    topk: int,
+    num_comm_sms: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pulls scheduled remote BF16 rows directly into native MXFP4 buffers."""
+    _validate_fp4_dispatch(
+        x, x_ptrs, schedule_peer_rank, schedule_peer_token_idx,
+        num_tokens, topk, num_comm_sms,
+    )
+    return _C.dispatch_mxfp4(
+        x, x_ptrs, schedule_peer_rank, schedule_peer_token_idx,
+        num_tokens, topk, num_comm_sms,
+    )
+
+
+@torch.library.custom_op("mok::dispatch_nvfp4", mutates_args=())
+def dispatch_nvfp4(
+    x: torch.Tensor,
+    x_ptrs: list[int],
+    schedule_peer_rank: torch.Tensor,
+    schedule_peer_token_idx: torch.Tensor,
+    num_tokens: torch.Tensor,
+    global_scale: torch.Tensor,
+    topk: int,
+    num_comm_sms: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pulls scheduled remote BF16 rows directly into native NVFP4 buffers."""
+    _validate_fp4_dispatch(
+        x, x_ptrs, schedule_peer_rank, schedule_peer_token_idx,
+        num_tokens, topk, num_comm_sms,
+    )
+    if (not global_scale.is_cuda or global_scale.device != x.device
+            or global_scale.dtype != torch.float32 or not global_scale.is_contiguous()
+            or global_scale.numel() != 1):
+        raise ValueError("global_scale must be contiguous CUDA float32 [1]")
+    return _C.dispatch_nvfp4(
+        x, x_ptrs, schedule_peer_rank, schedule_peer_token_idx,
+        num_tokens, global_scale, topk, num_comm_sms,
+    )
+
+
+def _validate_fp4_dispatch_range(
+    x: torch.Tensor,
+    schedule_peer_rank: torch.Tensor,
+    output: torch.Tensor,
+    scales: torch.Tensor,
+    row_start: int,
+    num_rows: int,
+    precision: str,
+) -> None:
+    capacity = schedule_peer_rank.numel()
+    hidden_size = x.shape[1]
+    if (type(row_start) is not int or row_start < 0 or row_start % 128
+            or type(num_rows) is not int or num_rows <= 0 or num_rows % 128
+            or row_start + num_rows > capacity):
+        raise ValueError("dispatch row range must be positive, 128-aligned, and within capacity")
+    if (not output.is_cuda or output.device != x.device
+            or output.dtype != torch.float4_e2m1fn_x2
+            or not output.is_contiguous()
+            or tuple(output.shape) != (capacity, hidden_size // 2)):
+        raise ValueError("output must be contiguous FP4 [capacity, hidden_size // 2]")
+    expected_scales = (
+        (capacity // 128, hidden_size // 128, 32, 16)
+        if precision == "mxfp4"
+        else (capacity // 128, hidden_size // 64, 512)
+    )
+    expected_dtype = torch.uint8 if precision == "mxfp4" else torch.float8_e4m3fn
+    if (not scales.is_cuda or scales.device != x.device
+            or scales.dtype != expected_dtype or not scales.is_contiguous()
+            or tuple(scales.shape) != expected_scales):
+        raise ValueError(f"{precision.upper()} scales must have production GEMM layout")
+
+
+@torch.library.custom_op(
+    "mok::dispatch_mxfp4_into", mutates_args=("output", "scales")
+)
+def dispatch_mxfp4_into(
+    x: torch.Tensor,
+    x_ptrs: list[int],
+    schedule_peer_rank: torch.Tensor,
+    schedule_peer_token_idx: torch.Tensor,
+    num_tokens: torch.Tensor,
+    output: torch.Tensor,
+    scales: torch.Tensor,
+    row_start: int,
+    num_rows: int,
+    topk: int,
+    num_comm_sms: int,
+) -> None:
+    """Pulls one expert-ordered row range into preallocated MXFP4 buffers."""
+    _validate_fp4_dispatch(
+        x, x_ptrs, schedule_peer_rank, schedule_peer_token_idx,
+        num_tokens, topk, num_comm_sms,
+    )
+    _validate_fp4_dispatch_range(
+        x, schedule_peer_rank, output, scales, row_start, num_rows, "mxfp4"
+    )
+    _C.dispatch_mxfp4_into(
+        x, x_ptrs, schedule_peer_rank, schedule_peer_token_idx, num_tokens,
+        output, scales, row_start, num_rows, topk, num_comm_sms,
+    )
+
+
+@torch.library.custom_op(
+    "mok::dispatch_nvfp4_into", mutates_args=("output", "scales")
+)
+def dispatch_nvfp4_into(
+    x: torch.Tensor,
+    x_ptrs: list[int],
+    schedule_peer_rank: torch.Tensor,
+    schedule_peer_token_idx: torch.Tensor,
+    num_tokens: torch.Tensor,
+    global_scale: torch.Tensor,
+    output: torch.Tensor,
+    scales: torch.Tensor,
+    row_start: int,
+    num_rows: int,
+    topk: int,
+    num_comm_sms: int,
+) -> None:
+    """Pulls one expert-ordered row range into preallocated NVFP4 buffers."""
+    _validate_fp4_dispatch(
+        x, x_ptrs, schedule_peer_rank, schedule_peer_token_idx,
+        num_tokens, topk, num_comm_sms,
+    )
+    if (not global_scale.is_cuda or global_scale.device != x.device
+            or global_scale.dtype != torch.float32 or not global_scale.is_contiguous()
+            or global_scale.numel() != 1):
+        raise ValueError("global_scale must be contiguous CUDA float32 [1]")
+    _validate_fp4_dispatch_range(
+        x, schedule_peer_rank, output, scales, row_start, num_rows, "nvfp4"
+    )
+    _C.dispatch_nvfp4_into(
+        x, x_ptrs, schedule_peer_rank, schedule_peer_token_idx, num_tokens,
+        global_scale, output, scales, row_start, num_rows, topk, num_comm_sms,
+    )
+
+
+@torch.library.custom_op(
+    "mok::combine_bf16_into", mutates_args=("local_output",)
+)
+def combine_bf16_into(
+    input: torch.Tensor,
+    local_output: torch.Tensor,
+    output_ptrs: list[int],
+    schedule_peer_rank: torch.Tensor,
+    schedule_peer_token_idx: torch.Tensor,
+    num_tokens: torch.Tensor,
+    row_start: int,
+    num_rows: int,
+    num_comm_sms: int,
+) -> None:
+    """Pushes one expert-ordered BF16 row range back to source-token routes."""
+    if (not input.is_cuda or input.dtype != torch.bfloat16
+            or not input.is_contiguous() or input.ndim != 2
+            or input.shape[1] <= 0 or input.shape[1] % 256):
+        raise ValueError("input must be contiguous CUDA bfloat16 [rows, hidden]")
+    if (not local_output.is_cuda or local_output.device != input.device
+            or local_output.dtype != torch.bfloat16
+            or not local_output.is_contiguous() or local_output.ndim != 2
+            or local_output.shape[0] <= 0
+            or local_output.shape[1] != input.shape[1]):
+        raise ValueError("local_output must be contiguous CUDA bfloat16 [routes, hidden]")
+    if (not isinstance(output_ptrs, list)
+            or len(output_ptrs) not in (2, 4, 8, 16, 32, 64)
+            or any(type(pointer) is not int or pointer <= 0 for pointer in output_ptrs)):
+        raise ValueError("output_ptrs must contain positive pointers for a supported EP size")
+    if (not schedule_peer_rank.is_cuda or schedule_peer_rank.device != input.device
+            or schedule_peer_rank.dtype != torch.int32
+            or not schedule_peer_rank.is_contiguous() or schedule_peer_rank.ndim != 1):
+        raise ValueError("schedule_peer_rank must be contiguous CUDA int32 [capacity]")
+    if (not schedule_peer_token_idx.is_cuda
+            or schedule_peer_token_idx.device != input.device
+            or schedule_peer_token_idx.dtype != torch.int32
+            or not schedule_peer_token_idx.is_contiguous()
+            or schedule_peer_token_idx.shape != schedule_peer_rank.shape):
+        raise ValueError("schedule_peer_token_idx must match schedule_peer_rank")
+    if (not num_tokens.is_cuda or num_tokens.device != input.device
+            or num_tokens.dtype != torch.int32 or not num_tokens.is_contiguous()
+            or tuple(num_tokens.shape) != (1,)):
+        raise ValueError("num_tokens must be contiguous CUDA int32 [1]")
+    capacity = schedule_peer_rank.numel()
+    if capacity <= 0 or capacity % 16:
+        raise ValueError("combine schedule capacity must be positive and 16-aligned")
+    if (type(row_start) is not int or row_start < 0 or row_start % 16
+            or type(num_rows) is not int or num_rows <= 0 or num_rows % 16
+            or row_start + num_rows > min(capacity, input.shape[0])):
+        raise ValueError("combine row range must be positive, 16-aligned, and in bounds")
+    if type(num_comm_sms) is not int or num_comm_sms <= 0:
+        raise ValueError("num_comm_sms must be a positive integer")
+    _C.combine_bf16_into(
+        input,
+        local_output,
+        output_ptrs,
+        schedule_peer_rank,
+        schedule_peer_token_idx,
+        num_tokens,
+        row_start,
+        num_rows,
+        num_comm_sms,
+    )
 
 
 @torch.library.custom_op("mok::dispatch_mlp_swiglu_combine_fwd_mxfp8", mutates_args=("combine_buffer",))
@@ -297,8 +545,8 @@ def dispatch_mlp_swiglu_combine_fwd_mxfp8(
         ):
             raise TypeError(f"{pointer_name} must be a list of positive integers")
     ep_size = len(x_ptrs)
-    if ep_size not in (4, 8, 16, 32, 64):
-        raise ValueError("x_ptrs length must be one of 4, 8, 16, 32, 64")
+    if ep_size not in (2, 4, 8, 16, 32, 64):
+        raise ValueError("x_ptrs length must be one of 2, 4, 8, 16, 32, 64")
     if len(combine_buffer_ptrs) != ep_size:
         raise ValueError("combine_buffer_ptrs length must match x_ptrs")
     if w_shared_gate.ndim != 2:
@@ -465,8 +713,8 @@ def dispatch_mlp_swiglu_combine_fwd_bf16(
         ):
             raise TypeError(f"{pointer_name} must be a list of positive integers")
     ep_size = len(x_ptrs)
-    if ep_size not in (4, 8, 16, 32, 64):
-        raise ValueError("x_ptrs length must be one of 4, 8, 16, 32, 64")
+    if ep_size not in (2, 4, 8, 16, 32, 64):
+        raise ValueError("x_ptrs length must be one of 2, 4, 8, 16, 32, 64")
     if len(combine_buffer_ptrs) != ep_size:
         raise ValueError("combine_buffer_ptrs length must match x_ptrs")
     if schedule_peer_rank.ndim != 1 or schedule_peer_rank.numel() == 0:
@@ -683,8 +931,8 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
         ):
             raise TypeError(f"{pointer_name} must be a list of positive integers")
     ep_size = len(x_ptrs)
-    if ep_size not in (4, 8, 16, 32, 64):
-        raise ValueError("x_ptrs length must be one of 4, 8, 16, 32, 64")
+    if ep_size not in (2, 4, 8, 16, 32, 64):
+        raise ValueError("x_ptrs length must be one of 2, 4, 8, 16, 32, 64")
     for pointer_name, pointers in (
         ("d_y_buffer_ptrs", d_y_buffer_ptrs),
         ("d_x_routed_buffer_ptrs", d_x_routed_buffer_ptrs),
@@ -953,8 +1201,8 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
         ):
             raise TypeError(f"{pointer_name} must be a list of positive integers")
     ep_size = len(x_ptrs)
-    if ep_size not in (4, 8, 16, 32, 64):
-        raise ValueError("x_ptrs length must be one of 4, 8, 16, 32, 64")
+    if ep_size not in (2, 4, 8, 16, 32, 64):
+        raise ValueError("x_ptrs length must be one of 2, 4, 8, 16, 32, 64")
     for pointer_name, pointers in pointer_lists[:-1]:
         if len(pointers) != ep_size:
             raise ValueError(f"{pointer_name} length must match x_ptrs")

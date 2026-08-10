@@ -64,6 +64,102 @@ def _mxfp8_quantize_fake(
     )
 
 
+@torch.library.register_fake("mok::dispatch_mxfp4")
+def _dispatch_mxfp4_fake(
+    x: torch.Tensor,
+    x_ptrs: list[int],
+    schedule_peer_rank: torch.Tensor,
+    schedule_peer_token_idx: torch.Tensor,
+    num_tokens: torch.Tensor,
+    topk: int,
+    num_comm_sms: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    capacity = schedule_peer_rank.numel()
+    hidden_size = x.shape[1]
+    return (
+        x.new_empty(
+            (capacity, hidden_size // 2), dtype=torch.float4_e2m1fn_x2
+        ),
+        x.new_empty(
+            (capacity // 128, hidden_size // 128, 32, 16), dtype=torch.uint8
+        ),
+    )
+
+
+@torch.library.register_fake("mok::dispatch_nvfp4")
+def _dispatch_nvfp4_fake(
+    x: torch.Tensor,
+    x_ptrs: list[int],
+    schedule_peer_rank: torch.Tensor,
+    schedule_peer_token_idx: torch.Tensor,
+    num_tokens: torch.Tensor,
+    global_scale: torch.Tensor,
+    topk: int,
+    num_comm_sms: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    capacity = schedule_peer_rank.numel()
+    hidden_size = x.shape[1]
+    return (
+        x.new_empty(
+            (capacity, hidden_size // 2), dtype=torch.float4_e2m1fn_x2
+        ),
+        x.new_empty(
+            (capacity // 128, hidden_size // 64, 512),
+            dtype=torch.float8_e4m3fn,
+        ),
+    )
+
+
+@torch.library.register_fake("mok::dispatch_mxfp4_into")
+def _dispatch_mxfp4_into_fake(
+    x: torch.Tensor,
+    x_ptrs: list[int],
+    schedule_peer_rank: torch.Tensor,
+    schedule_peer_token_idx: torch.Tensor,
+    num_tokens: torch.Tensor,
+    output: torch.Tensor,
+    scales: torch.Tensor,
+    row_start: int,
+    num_rows: int,
+    topk: int,
+    num_comm_sms: int,
+) -> None:
+    return None
+
+
+@torch.library.register_fake("mok::dispatch_nvfp4_into")
+def _dispatch_nvfp4_into_fake(
+    x: torch.Tensor,
+    x_ptrs: list[int],
+    schedule_peer_rank: torch.Tensor,
+    schedule_peer_token_idx: torch.Tensor,
+    num_tokens: torch.Tensor,
+    global_scale: torch.Tensor,
+    output: torch.Tensor,
+    scales: torch.Tensor,
+    row_start: int,
+    num_rows: int,
+    topk: int,
+    num_comm_sms: int,
+) -> None:
+    return None
+
+
+@torch.library.register_fake("mok::combine_bf16_into")
+def _combine_bf16_into_fake(
+    input: torch.Tensor,
+    local_output: torch.Tensor,
+    output_ptrs: list[int],
+    schedule_peer_rank: torch.Tensor,
+    schedule_peer_token_idx: torch.Tensor,
+    num_tokens: torch.Tensor,
+    row_start: int,
+    num_rows: int,
+    num_comm_sms: int,
+) -> None:
+    return None
+
+
 @torch.library.register_fake("mok::dispatch_mlp_swiglu_combine_fwd_mxfp8")
 def _dispatch_mlp_swiglu_combine_fwd_mxfp8_fake(
     x: torch.Tensor,

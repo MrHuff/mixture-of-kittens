@@ -1,3 +1,4 @@
+#include "fp4_dispatch.cuh"
 #include "mok_megakernel.cuh"
 #include "mxfp8.cuh"
 #include "scheduler.cuh"
@@ -15,6 +16,34 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mxfp8_quantize", &mxfp8_quantize::mxfp8_quantize_entrypoint, "",
           pybind11::arg("x_bf16"),
           pybind11::arg("return_normal"), pybind11::arg("return_transposed"));
+    m.def("dispatch_mxfp4", &fp4_dispatch::dispatch_mxfp4, "",
+          pybind11::arg("x"), pybind11::arg("x_ptrs"),
+          pybind11::arg("schedule_peer_rank"), pybind11::arg("schedule_peer_token_idx"),
+          pybind11::arg("num_tokens"), pybind11::arg("topk"), pybind11::arg("num_comm_sms"));
+    m.def("dispatch_nvfp4", &fp4_dispatch::dispatch_nvfp4, "",
+          pybind11::arg("x"), pybind11::arg("x_ptrs"),
+          pybind11::arg("schedule_peer_rank"), pybind11::arg("schedule_peer_token_idx"),
+          pybind11::arg("num_tokens"), pybind11::arg("global_scale"), pybind11::arg("topk"),
+          pybind11::arg("num_comm_sms"));
+    m.def("dispatch_mxfp4_into", &fp4_dispatch::dispatch_mxfp4_into, "",
+          pybind11::arg("x"), pybind11::arg("x_ptrs"),
+          pybind11::arg("schedule_peer_rank"), pybind11::arg("schedule_peer_token_idx"),
+          pybind11::arg("num_tokens"), pybind11::arg("output"), pybind11::arg("scales"),
+          pybind11::arg("row_start"), pybind11::arg("num_rows"),
+          pybind11::arg("topk"), pybind11::arg("num_comm_sms"));
+    m.def("dispatch_nvfp4_into", &fp4_dispatch::dispatch_nvfp4_into, "",
+          pybind11::arg("x"), pybind11::arg("x_ptrs"),
+          pybind11::arg("schedule_peer_rank"), pybind11::arg("schedule_peer_token_idx"),
+          pybind11::arg("num_tokens"), pybind11::arg("global_scale"),
+          pybind11::arg("output"), pybind11::arg("scales"),
+          pybind11::arg("row_start"), pybind11::arg("num_rows"),
+          pybind11::arg("topk"), pybind11::arg("num_comm_sms"));
+    m.def("combine_bf16_into", &fp4_dispatch::combine_bf16_into, "",
+          pybind11::arg("input"), pybind11::arg("local_output"),
+          pybind11::arg("output_ptrs"),
+          pybind11::arg("schedule_peer_rank"), pybind11::arg("schedule_peer_token_idx"),
+          pybind11::arg("num_tokens"), pybind11::arg("row_start"),
+          pybind11::arg("num_rows"), pybind11::arg("num_comm_sms"));
     m.def("dispatch_mlp_swiglu_combine_fwd_mxfp8", &dispatch_mlp_swiglu_combine_fwd_mxfp8, "",
           pybind11::arg("x"), pybind11::arg("x_ptrs"),
           pybind11::arg("combine_buffer"), pybind11::arg("combine_buffer_ptrs"),

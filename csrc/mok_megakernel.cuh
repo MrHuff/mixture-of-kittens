@@ -3005,6 +3005,14 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8(
     const int num_devices = static_cast<int>(x_ptrs.size());
 
     switch (num_devices) {
+        case 2:
+            return dispatch_mlp_swiglu_combiner<2>::dispatch_mlp_swiglu_combine_fwd_mxfp8(
+                x, x_ptrs, combine_buffer, combine_buffer_ptrs,
+                w_shared_gate, w_routed_gate, w_routed_gate_sc,
+                w_shared_up, w_routed_up, w_routed_up_sc,
+                w_shared_down, w_routed_down, w_routed_down_sc,
+                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
         case 4:
             return dispatch_mlp_swiglu_combiner<4>::dispatch_mlp_swiglu_combine_fwd_mxfp8(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
@@ -3047,7 +3055,7 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8(
                 topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
         default:
             throw std::runtime_error("MoK: dispatch_mlp_swiglu_combine_fwd_mxfp8 unsupported num_devices=" +
-                                     std::to_string(num_devices) + " (supported: 4, 8, 16, 32, 64)");
+                                     std::to_string(num_devices) + " (supported: 2, 4, 8, 16, 32, 64)");
     }
 }
 
@@ -3076,6 +3084,12 @@ dispatch_mlp_swiglu_combine_fwd_bf16(
 ) {
     const int num_devices = static_cast<int>(x_ptrs.size());
     switch (num_devices) {
+        case 2:
+            return dispatch_mlp_swiglu_combiner<2, utils::RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_fwd_bf16(
+                x, x_ptrs, combine_buffer, combine_buffer_ptrs,
+                w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
+                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
         case 4:
             return dispatch_mlp_swiglu_combiner<4, utils::RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_fwd_bf16(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
@@ -3108,7 +3122,7 @@ dispatch_mlp_swiglu_combine_fwd_bf16(
                 topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
         default:
             throw std::runtime_error("MoK: dispatch_mlp_swiglu_combine_fwd_bf16 unsupported num_devices=" +
-                                     std::to_string(num_devices) + " (supported: 4, 8, 16, 32, 64)");
+                                     std::to_string(num_devices) + " (supported: 2, 4, 8, 16, 32, 64)");
     }
 }
 
@@ -3174,6 +3188,22 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8(
     const int num_devices = static_cast<int>(x_ptrs.size());
 
     switch (num_devices) {
+        case 2:
+            return dispatch_mlp_swiglu_combiner<2>::dispatch_mlp_swiglu_combine_bwd_mxfp8(
+                d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
+                router_weight_buffer, router_weight_buffer_ptrs, d_router_weight_buffer, d_router_weight_buffer_ptrs,
+                w_shared_gate, w_routed_gate_T, w_routed_gate_T_sc,
+                w_shared_up, w_routed_up_T, w_routed_up_T_sc,
+                w_shared_down, w_routed_down_T, w_routed_down_T_sc,
+                x_fp8_t_routed, x_sc_t_routed,
+                gate_shared, gate_fp8_routed, gate_sc_routed,
+                up_shared, up_fp8_routed, up_sc_routed,
+                hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed,
+                x, x_ptrs,
+                w_routed_gate, w_routed_gate_sc,
+                w_routed_up, w_routed_up_sc,
+                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
         case 4:
             return dispatch_mlp_swiglu_combiner<4>::dispatch_mlp_swiglu_combine_bwd_mxfp8(
                 d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
@@ -3256,7 +3286,7 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8(
                 topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
         default:
             throw std::runtime_error("MoK: dispatch_mlp_swiglu_combine_bwd_mxfp8 unsupported num_devices=" +
-                                     std::to_string(num_devices) + " (supported: 4, 8, 16, 32, 64)");
+                                     std::to_string(num_devices) + " (supported: 2, 4, 8, 16, 32, 64)");
     }
 }
 
@@ -3299,6 +3329,14 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
 ) {
     const int num_devices = static_cast<int>(x_ptrs.size());
     switch (num_devices) {
+        case 2:
+            return dispatch_mlp_swiglu_combiner<2, utils::RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_bwd_bf16(
+                d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
+                router_weight_buffer, router_weight_buffer_ptrs, d_router_weight_buffer, d_router_weight_buffer_ptrs,
+                w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
+                x_routed, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, x, x_ptrs,
+                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
         case 4:
             return dispatch_mlp_swiglu_combiner<4, utils::RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_bwd_bf16(
                 d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
@@ -3341,6 +3379,6 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
                 topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
         default:
             throw std::runtime_error("MoK: dispatch_mlp_swiglu_combine_bwd_bf16 unsupported num_devices=" +
-                                     std::to_string(num_devices) + " (supported: 4, 8, 16, 32, 64)");
+                                     std::to_string(num_devices) + " (supported: 2, 4, 8, 16, 32, 64)");
     }
 }

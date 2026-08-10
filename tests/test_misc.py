@@ -646,6 +646,91 @@ def test_fake_tensor_metadata(
         )
 
         x = tensor((num_local_tokens, hidden_size), torch.bfloat16)
+        mxfp4_dispatch = ops.dispatch_mxfp4(
+            x, pointers, schedule[0], schedule[1], schedule[2], topk, 40
+        )
+        _assert_metadata(
+            mxfp4_dispatch,
+            (
+                ((schedule_capacity, hidden_size // 2), torch.float4_e2m1fn_x2),
+                (
+                    (schedule_capacity // 128, hidden_size // 128, 32, 16),
+                    torch.uint8,
+                ),
+            ),
+        )
+        assert (
+            ops.dispatch_mxfp4_into(
+                x,
+                pointers,
+                schedule[0],
+                schedule[1],
+                schedule[2],
+                mxfp4_dispatch[0],
+                mxfp4_dispatch[1],
+                0,
+                128,
+                topk,
+                40,
+            )
+            is None
+        )
+        nvfp4_global_scale = tensor((1,), torch.float32)
+        nvfp4_dispatch = ops.dispatch_nvfp4(
+            x,
+            pointers,
+            schedule[0],
+            schedule[1],
+            schedule[2],
+            nvfp4_global_scale,
+            topk,
+            40,
+        )
+        _assert_metadata(
+            nvfp4_dispatch,
+            (
+                ((schedule_capacity, hidden_size // 2), torch.float4_e2m1fn_x2),
+                (
+                    (schedule_capacity // 128, hidden_size // 64, 512),
+                    torch.float8_e4m3fn,
+                ),
+            ),
+        )
+        assert (
+            ops.dispatch_nvfp4_into(
+                x,
+                pointers,
+                schedule[0],
+                schedule[1],
+                schedule[2],
+                nvfp4_global_scale,
+                nvfp4_dispatch[0],
+                nvfp4_dispatch[1],
+                0,
+                128,
+                topk,
+                40,
+            )
+            is None
+        )
+        combine_input = tensor((schedule_capacity, hidden_size), torch.bfloat16)
+        combine_output = tensor(
+            (num_local_tokens * topk, hidden_size), torch.bfloat16
+        )
+        assert (
+            ops.combine_bf16_into(
+                combine_input,
+                combine_output,
+                pointers,
+                schedule[0],
+                schedule[1],
+                schedule[2],
+                0,
+                128,
+                40,
+            )
+            is None
+        )
         router_weights = tensor((num_local_tokens, topk), torch.float32)
         shared_gate = tensor(
             (intermediate_size, hidden_size),
@@ -1007,6 +1092,11 @@ def test_custom_op_mutation_schemas() -> None:
         "barrier_all": {"barrier_buffer", "target"},
         "schedule": set(),
         "mxfp8_quantize": set(),
+        "dispatch_mxfp4": set(),
+        "dispatch_nvfp4": set(),
+        "dispatch_mxfp4_into": {"output", "scales"},
+        "dispatch_nvfp4_into": {"output", "scales"},
+        "combine_bf16_into": {"local_output"},
         "dispatch_mlp_swiglu_combine_fwd_mxfp8": {"combine_buffer"},
         "dispatch_mlp_swiglu_combine_fwd_bf16": {"combine_buffer"},
         "dispatch_mlp_swiglu_combine_bwd_mxfp8": {

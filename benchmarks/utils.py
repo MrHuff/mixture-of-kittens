@@ -6,8 +6,8 @@ import torch.distributed as dist
 from tests.utils import check_correctness
 
 
-WARMUP_ITERS = 500
-TIMED_ITERS = 100
+WARMUP_ITERS = int(os.environ.get("MOK_BENCHMARK_WARMUP_ITERS", 500))
+TIMED_ITERS = int(os.environ.get("MOK_BENCHMARK_TIMED_ITERS", 100))
 
 
 def get_num_local_experts(num_experts, world_size):

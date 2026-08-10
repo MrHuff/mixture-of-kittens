@@ -10,6 +10,8 @@ from .ops import (
     all_gather_top_experts,
     barrier_all,
     bwd_epilogue,
+    dispatch_mxfp4,
+    dispatch_nvfp4,
     dispatch_mlp_swiglu_combine_bwd_mxfp8,
     dispatch_mlp_swiglu_combine_bwd_bf16,
     dispatch_mlp_swiglu_combine_fwd_mxfp8,
@@ -151,8 +153,8 @@ def validate_workspace_args(
         raise RuntimeError("process group must have a nonempty group_name")
     ep_rank = dist.get_rank(group=group)
     ep_size = dist.get_world_size(group=group)
-    if ep_size not in (4, 8, 16, 32, 64):
-        raise ValueError("MoK EP size must be one of 4, 8, 16, 32, 64")
+    if ep_size not in (2, 4, 8, 16, 32, 64):
+        raise ValueError("MoK EP size must be one of 2, 4, 8, 16, 32, 64")
     if not 0 <= ep_rank < ep_size:
         raise RuntimeError("current process is not a member of the EP process group")
 
@@ -428,6 +430,49 @@ def build_schedule(
         peer_rank=schedule_peer_rank, peer_token_idx=schedule_peer_token_idx,
         num_tokens=num_tokens, tokens_per_expert=tokens_per_expert,
     )
+
+
+def dispatch_fp4(
+    workspace: MoKWorkspace,
+    schedule: MoKSchedule,
+    x: torch.Tensor,
+    precision: str,
+    *,
+    global_scale: torch.Tensor | None = None,
+    num_comm_sms: int = 40,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pulls remote routed rows directly into expert-ordered FP4 buffers."""
+    if not isinstance(workspace, MoKWorkspace):
+        raise TypeError("workspace must be a MoKWorkspace")
+    if not isinstance(schedule, MoKSchedule):
+        raise TypeError("schedule must be a MoKSchedule")
+    if (not x.is_cuda or x.device != workspace.device or x.dtype != torch.bfloat16
+            or not x.is_contiguous()
+            or tuple(x.shape) != (workspace.num_local_tokens, workspace.hidden_size)):
+        raise ValueError("x must match the workspace as contiguous CUDA bfloat16")
+    if precision not in ("mxfp4", "nvfp4"):
+        raise ValueError("precision must be 'mxfp4' or 'nvfp4'")
+    if precision == "nvfp4" and global_scale is None:
+        raise ValueError("NVFP4 dispatch requires a delayed/global decode scale")
+
+    workspace.x_buffer.copy_(x)
+    barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
+                workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
+    if precision == "mxfp4":
+        output = dispatch_mxfp4(
+            workspace.x_buffer, workspace.x_buffer_ptrs,
+            schedule.peer_rank, schedule.peer_token_idx,
+            schedule.num_tokens, workspace.topk, num_comm_sms,
+        )
+    else:
+        output = dispatch_nvfp4(
+            workspace.x_buffer, workspace.x_buffer_ptrs,
+            schedule.peer_rank, schedule.peer_token_idx,
+            schedule.num_tokens, global_scale, workspace.topk, num_comm_sms,
+        )
+    barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
+                workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
+    return output
 
 
 def validate_inputs(
