@@ -385,6 +385,13 @@ def main() -> None:
         macrobatch_size=131072,
         schedule_capacity_multiplier=config.schedule_capacity_multiplier,
     )
+    mxfp8_control_config = functional.MoKConfig(
+        fwd_num_comm_sms=36,
+        bwd_num_comm_sms=36,
+        minibatch_size=4096,
+        macrobatch_size=131072,
+        schedule_capacity_multiplier=config.schedule_capacity_multiplier,
+    )
     x, top_experts, router_weights = _make_inputs(
         rank,
         device,
@@ -616,6 +623,15 @@ def main() -> None:
         routed_up_weights = gate_up_weights[
             :, args.expert_hidden:
         ].contiguous()
+        routed_gate_mxfp8 = ops.mxfp8_quantize(
+            routed_gate_weights, True, True
+        )
+        routed_up_mxfp8 = ops.mxfp8_quantize(
+            routed_up_weights, True, True
+        )
+        routed_down_mxfp8 = ops.mxfp8_quantize(
+            down_weights, True, True
+        )
         gate_up_mxfp4 = torch.empty(
             num_tokens, gate_up_size, dtype=torch.bfloat16, device=device
         )
@@ -945,6 +961,22 @@ def main() -> None:
                 routed_gate_weights,
                 routed_up_weights,
                 down_weights,
+            )
+            return output
+
+        def run_mxfp8_mok_forward() -> torch.Tensor:
+            output, _ = functional.forward(
+                mxfp8_control_config,
+                workspace,
+                schedule,
+                x,
+                router_weights,
+                shared_gate_weights,
+                shared_up_weights,
+                shared_down_weights,
+                routed_gate_mxfp8[:2],
+                routed_up_mxfp8[:2],
+                routed_down_mxfp8[:2],
             )
             return output
 
@@ -1507,6 +1539,10 @@ def main() -> None:
                 (
                     "BF16 full MoE forward (prebuilt schedule)",
                     run_bf16_mok_forward,
+                ),
+                (
+                    "MXFP8 full MoE forward (prebuilt schedule)",
+                    run_mxfp8_mok_forward,
                 ),
                 ("BF16 routed expert MLP", run_bf16_routed_mlp),
                 ("MXFP4 gate/up GEMM", lambda: run_mxfp4_gate_up(actual_mxfp4)),
