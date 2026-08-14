@@ -18,17 +18,18 @@ namespace fp4_dispatch {
 
 static constexpr int TILE_ROWS = 128;
 static constexpr int TILE_COLS = 128;
-static constexpr int PULL_COLS = 512;
+static constexpr int DEFAULT_PULL_COLS = 640;
 static constexpr int COMBINE_ROWS = 16;
-static constexpr int COMBINE_COLS = 1024;
-static constexpr int COMBINE_PIPE_DEPTH = 7;
+static constexpr int DEFAULT_COMBINE_COLS = 0;
 static constexpr int MAX_EP_SIZE = 64;
 
+template<int PULL_COLS>
 struct config {
     static constexpr int CLUSTER_SIZE = 1;
     static constexpr int NUM_THREADS = TILE_ROWS;
     static constexpr int DYNAMIC_SHARED_MEMORY =
         TILE_ROWS * PULL_COLS * static_cast<int>(sizeof(bf16)) + 2048;
+    static_assert(DYNAMIC_SHARED_MEMORY <= MAX_SHARED_MEMORY - 1024);
 };
 
 struct globals {
@@ -46,18 +47,25 @@ struct globals {
     int hidden_size;
     int topk;
     int num_comm_sms;
+    int pull_cols;
 
     __host__ inline dim3 grid() const {
-        const int tasks = ((hidden_size + PULL_COLS - 1) / PULL_COLS)
+        const int tasks = ((hidden_size + pull_cols - 1) / pull_cols)
                         * num_row_blocks;
         return dim3(std::min(tasks, num_comm_sms));
     }
 };
 
+template<int COMBINE_COLS>
 struct combine_config {
     static constexpr int CLUSTER_SIZE = 1;
     static constexpr int NUM_THREADS = TILE_ROWS;
+    static constexpr int PIPE_DEPTH =
+        (MAX_SHARED_MEMORY - 1024)
+        / (COMBINE_ROWS * COMBINE_COLS * static_cast<int>(sizeof(bf16)));
     static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - 1024;
+    static_assert(COMBINE_COLS > 0 && COMBINE_COLS % TILE_COLS == 0);
+    static_assert(PIPE_DEPTH > 0);
 };
 
 struct combine_globals {
@@ -72,12 +80,13 @@ struct combine_globals {
     int hidden_size;
     int output_rows;
     int num_comm_sms;
+    int combine_cols;
+    int pipe_depth;
 
     __host__ inline dim3 grid() const {
-        const int tiles = ((hidden_size + COMBINE_COLS - 1) / COMBINE_COLS)
+        const int tiles = ((hidden_size + combine_cols - 1) / combine_cols)
                         * (num_rows / COMBINE_ROWS);
-        const int tasks = (tiles + COMBINE_PIPE_DEPTH - 1)
-                        / COMBINE_PIPE_DEPTH;
+        const int tasks = (tiles + pipe_depth - 1) / pipe_depth;
         return dim3(std::min(tasks, num_comm_sms));
     }
 };
@@ -184,7 +193,7 @@ static __device__ __forceinline__ void quantize_row(
     }
 }
 
-template <bool NVFP4>
+template <bool NVFP4, int PULL_COLS>
 static __device__ void kernel(const globals &g) {
     const int tid = threadIdx.x;
     extern __shared__ int shared_storage[];
@@ -262,7 +271,10 @@ static __device__ void kernel(const globals &g) {
     }
 }
 
+template<int COMBINE_COLS>
 static __device__ void combine_kernel(const combine_globals &g) {
+    constexpr int COMBINE_PIPE_DEPTH =
+        combine_config<COMBINE_COLS>::PIPE_DEPTH;
     const int tid = threadIdx.x;
     const bool is_worker = tid < COMBINE_ROWS;
     extern __shared__ int shared_storage[];
@@ -407,7 +419,8 @@ static __host__ void launch_into(
     int64_t row_start,
     int64_t num_rows,
     int topk,
-    int num_comm_sms
+    int num_comm_sms,
+    int pull_cols = DEFAULT_PULL_COLS
 ) {
     validate_inputs(x, x_ptrs, schedule_peer_rank, schedule_peer_token_idx,
                     num_tokens, topk, num_comm_sms);
@@ -461,7 +474,23 @@ static __host__ void launch_into(
     g.hidden_size = static_cast<int>(hidden);
     g.topk = topk;
     g.num_comm_sms = num_comm_sms;
-    kittens::py::launch_kernel<config, globals, kernel<NVFP4>>(g);
+    g.pull_cols = pull_cols;
+    switch (pull_cols) {
+        case 512:
+            kittens::py::launch_kernel<config<512>, globals, kernel<NVFP4, 512>>(g);
+            break;
+        case 640:
+            kittens::py::launch_kernel<config<640>, globals, kernel<NVFP4, 640>>(g);
+            break;
+        case 768:
+            kittens::py::launch_kernel<config<768>, globals, kernel<NVFP4, 768>>(g);
+            break;
+        case 896:
+            kittens::py::launch_kernel<config<896>, globals, kernel<NVFP4, 896>>(g);
+            break;
+        default:
+            TORCH_CHECK(false, "pull_cols must be one of 512, 640, 768, or 896");
+    }
 }
 
 template <bool NVFP4>
@@ -536,11 +565,12 @@ static __host__ inline void dispatch_mxfp4_into(
     int64_t row_start,
     int64_t num_rows,
     int topk,
-    int num_comm_sms
+    int num_comm_sms,
+    int pull_cols = DEFAULT_PULL_COLS
 ) {
     launch_into<false>(x, x_ptrs, schedule_peer_rank, schedule_peer_token_idx,
                        num_tokens, at::Tensor{}, output, scales, row_start,
-                       num_rows, topk, num_comm_sms);
+                       num_rows, topk, num_comm_sms, pull_cols);
 }
 
 static __host__ inline void dispatch_nvfp4_into(
@@ -571,7 +601,8 @@ static __host__ inline void combine_bf16_into(
     const at::Tensor &num_tokens,
     int64_t row_start,
     int64_t num_rows,
-    int num_comm_sms
+    int num_comm_sms,
+    int combine_cols = DEFAULT_COMBINE_COLS
 ) {
     TORCH_CHECK(input.is_cuda() && input.is_contiguous()
                 && input.scalar_type() == at::kBFloat16 && input.dim() == 2
@@ -614,6 +645,16 @@ static __host__ inline void combine_bf16_into(
     TORCH_CHECK(row_start + num_rows <= input.size(0),
                 "combine row range exceeds input rows");
     TORCH_CHECK(num_comm_sms > 0, "combine num_comm_sms must be positive");
+    TORCH_CHECK(combine_cols == 0 || combine_cols == 512 || combine_cols == 640
+                || combine_cols == 768 || combine_cols == 1024
+                || combine_cols == 1280 || combine_cols == 2560,
+                "combine_cols must be 0, 512, 640, 768, 1024, 1280, or 2560");
+
+    const int selected_combine_cols = combine_cols == 0
+        ? (input.size(1) % 2560 == 0 ? 2560
+           : input.size(1) % 1280 == 0 ? 1280
+           : 1024)
+        : combine_cols;
 
     combine_globals g{};
     g.input = reinterpret_cast<bf16 *>(input.data_ptr());
@@ -628,7 +669,23 @@ static __host__ inline void combine_bf16_into(
     g.hidden_size = static_cast<int>(input.size(1));
     g.output_rows = static_cast<int>(local_output.size(0));
     g.num_comm_sms = num_comm_sms;
-    kittens::py::launch_kernel<combine_config, combine_globals, combine_kernel>(g);
+    g.combine_cols = selected_combine_cols;
+    auto launch = [&]<int COMBINE_COLS>() {
+        g.pipe_depth = combine_config<COMBINE_COLS>::PIPE_DEPTH;
+        kittens::py::launch_kernel<
+            combine_config<COMBINE_COLS>,
+            combine_globals,
+            combine_kernel<COMBINE_COLS>
+        >(g);
+    };
+    switch (selected_combine_cols) {
+        case 512: launch.template operator()<512>(); break;
+        case 640: launch.template operator()<640>(); break;
+        case 768: launch.template operator()<768>(); break;
+        case 1024: launch.template operator()<1024>(); break;
+        case 1280: launch.template operator()<1280>(); break;
+        case 2560: launch.template operator()<2560>(); break;
+    }
 }
 
 } // namespace fp4_dispatch

@@ -156,6 +156,7 @@ def _combine_bf16_into_fake(
     row_start: int,
     num_rows: int,
     num_comm_sms: int,
+    combine_cols: int = 0,
 ) -> None:
     return None
 
@@ -404,6 +405,8 @@ def _fwd_epilogue_fake(
     y_shared: torch.Tensor,
     combine_buffer: torch.Tensor,
     topk_weights: torch.Tensor,
+    tokens_per_cta: int = 2,
+    cols_per_cta: int = 0,
 ) -> torch.Tensor:  # output
     return y_shared.new_empty(y_shared.shape)
 

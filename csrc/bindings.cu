@@ -30,7 +30,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("schedule_peer_rank"), pybind11::arg("schedule_peer_token_idx"),
           pybind11::arg("num_tokens"), pybind11::arg("output"), pybind11::arg("scales"),
           pybind11::arg("row_start"), pybind11::arg("num_rows"),
-          pybind11::arg("topk"), pybind11::arg("num_comm_sms"));
+          pybind11::arg("topk"), pybind11::arg("num_comm_sms"),
+          pybind11::arg("pull_cols") = fp4_dispatch::DEFAULT_PULL_COLS);
     m.def("dispatch_nvfp4_into", &fp4_dispatch::dispatch_nvfp4_into, "",
           pybind11::arg("x"), pybind11::arg("x_ptrs"),
           pybind11::arg("schedule_peer_rank"), pybind11::arg("schedule_peer_token_idx"),
@@ -43,7 +44,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("output_ptrs"),
           pybind11::arg("schedule_peer_rank"), pybind11::arg("schedule_peer_token_idx"),
           pybind11::arg("num_tokens"), pybind11::arg("row_start"),
-          pybind11::arg("num_rows"), pybind11::arg("num_comm_sms"));
+          pybind11::arg("num_rows"), pybind11::arg("num_comm_sms"),
+          pybind11::arg("combine_cols") = fp4_dispatch::DEFAULT_COMBINE_COLS);
     m.def("dispatch_mlp_swiglu_combine_fwd_mxfp8", &dispatch_mlp_swiglu_combine_fwd_mxfp8, "",
           pybind11::arg("x"), pybind11::arg("x_ptrs"),
           pybind11::arg("combine_buffer"), pybind11::arg("combine_buffer_ptrs"),
@@ -101,7 +103,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("topk"), pybind11::arg("swiglu_limit"),
           pybind11::arg("num_comm_sms"), pybind11::arg("macrobatch_size"), pybind11::arg("minibatch_size"));
     m.def("fwd_epilogue", &utils::fwd_epilogue, "",
-          pybind11::arg("y_shared"), pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"));
+          pybind11::arg("y_shared"), pybind11::arg("combine_buffer"),
+          pybind11::arg("topk_weights"), pybind11::arg("tokens_per_cta") = 2,
+          pybind11::arg("cols_per_cta") = 0);
     m.def("bwd_epilogue", &utils::bwd_epilogue, "",
           pybind11::arg("d_x_shared"), pybind11::arg("d_x_routed_buffer"));
 }

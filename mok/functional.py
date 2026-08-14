@@ -144,7 +144,10 @@ def validate_workspace_args(
         raise ValueError("hidden_size must be divisible by 256")
     if type(topk) is not int or not 0 < topk <= 255:
         raise ValueError("topk must be an integer in [1, 255]")
-    fwd_epilogue_smem_bytes = 2 * ((topk + 1) * 2048 + topk * 4) + 1024
+    fwd_epilogue_cols = 1280 if hidden_size % 1280 == 0 else 1024
+    fwd_epilogue_smem_bytes = 2 * (
+        (topk + 1) * fwd_epilogue_cols * 2 + topk * 4
+    ) + 1024
     if fwd_epilogue_smem_bytes > device_properties.shared_memory_per_block_optin:
         raise ValueError("topk requires more dynamic shared memory than the device supports")
 

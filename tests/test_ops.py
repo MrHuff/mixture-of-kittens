@@ -1644,6 +1644,41 @@ def test_fwd_epilogue(context: tuple[int, int, torch.device]) -> None:
         )
 
     num_local_tokens = 512
+    hidden_dim = 2560
+    topk = 6
+    generator = torch.Generator(device=device).manual_seed(4321 + rank)
+    y_shared = torch.randn(
+        num_local_tokens, hidden_dim, generator=generator,
+        device=device, dtype=torch.bfloat16)
+    combine_buffer = torch.randn(
+        num_local_tokens * topk, hidden_dim, generator=generator,
+        device=device, dtype=torch.bfloat16)
+    topk_weights = torch.softmax(
+        torch.randn(
+            num_local_tokens, topk, generator=generator, device=device),
+        dim=-1,
+    )
+    auto_output = fwd_epilogue(y_shared, combine_buffer, topk_weights)
+    for cols_per_cta in (1024, 1280, 2560):
+        configured_output = fwd_epilogue(
+            y_shared,
+            combine_buffer,
+            topk_weights,
+            cols_per_cta=cols_per_cta,
+        )
+        if not torch.equal(configured_output, auto_output):
+            raise AssertionError(
+                f"{cols_per_cta}-column epilogue must match auto exactly"
+            )
+    check_correctness(
+        "DeepSeek debug epilogue",
+        run_fwd_epilogue_reference(y_shared, combine_buffer, topk_weights),
+        auto_output,
+        BF16_TOLERANCE,
+        print_stats=rank == 0,
+    )
+
+    num_local_tokens = 512
     hidden_dim = 256
     shared_memory_limit = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
     topk = (shared_memory_limit - 5120) // 4104
@@ -1697,6 +1732,13 @@ def test_fwd_epilogue(context: tuple[int, int, torch.device]) -> None:
         (
             "combine shape",
             {"combine_buffer": combine_buffer[:-1]},
+            ValueError,
+        ),
+        ("tokens per CTA", {"tokens_per_cta": 3}, ValueError),
+        ("columns per CTA", {"cols_per_cta": 2048}, ValueError),
+        (
+            "epilogue dynamic shared memory",
+            {"tokens_per_cta": 8, "cols_per_cta": 2560},
             ValueError,
         ),
     ):

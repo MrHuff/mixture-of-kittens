@@ -39,9 +39,10 @@ struct config_fwd_epilogue {
     static constexpr int NUM_WARPS = NUM_THREADS / WARP_THREADS;
 };
 
+template<int NB_, int TOKENS_PER_CTA_>
 struct globals_fwd_epilogue {
-    static constexpr int Nb = 1024; // TMA ignores elements outside of box, so this supports arbitrary shapes
-    static constexpr int TOKENS_PER_CTA = 2;
+    static constexpr int Nb = NB_; // TMA ignores elements outside of box, so this supports arbitrary shapes
+    static constexpr int TOKENS_PER_CTA = TOKENS_PER_CTA_;
 
     using token_vec = sv_bf<Nb>;
     using activation_gl = gl<bf16, 1, 1, -1, -1, token_vec>;
@@ -62,19 +63,23 @@ struct globals_fwd_epilogue {
     }
 };
 
-static __device__ __forceinline__ void fwd_epilogue_kernel(const globals_fwd_epilogue &g) {
-    constexpr int TOKENS_PER_CTA = globals_fwd_epilogue::TOKENS_PER_CTA;
+template<int NB_, int TOKENS_PER_CTA_>
+static __device__ __forceinline__ void fwd_epilogue_kernel(
+    const globals_fwd_epilogue<NB_, TOKENS_PER_CTA_> &g
+) {
+    using globals = globals_fwd_epilogue<NB_, TOKENS_PER_CTA_>;
+    constexpr int TOKENS_PER_CTA = globals::TOKENS_PER_CTA;
     using compute_group = group<config_fwd_epilogue::NUM_WARPS>;
 
     const int tid = threadIdx.x;
     const int topk = g.topk_weights.cols();
     const int num_tokens_per_stage = topk + 1;
-    const int col_blocks = (g.y_shared.cols() + globals_fwd_epilogue::Nb - 1) / globals_fwd_epilogue::Nb;
+    const int col_blocks = (g.y_shared.cols() + globals::Nb - 1) / globals::Nb;
     const int col_block_idx = blockIdx.x % col_blocks;
     const int first_token_idx = blockIdx.x / col_blocks * TOKENS_PER_CTA;
 
     extern __shared__ int __shm[];
-    auto *token_vecs = reinterpret_cast<globals_fwd_epilogue::token_vec*>((reinterpret_cast<uint64_t>(&__shm[0]) + 1023) & ~uint64_t(1023));
+    auto *token_vecs = reinterpret_cast<typename globals::token_vec*>((reinterpret_cast<uint64_t>(&__shm[0]) + 1023) & ~uint64_t(1023));
     float *weights = reinterpret_cast<float*>(token_vecs + TOKENS_PER_CTA * num_tokens_per_stage); // (TOKENS_PER_CTA, topk)
 
     __shared__ semaphore inputs_arrived[TOKENS_PER_CTA];
@@ -82,7 +87,7 @@ static __device__ __forceinline__ void fwd_epilogue_kernel(const globals_fwd_epi
         #pragma unroll
         for (int stage = 0; stage < TOKENS_PER_CTA; ++stage) {
             init_semaphore(inputs_arrived[stage], 0, 1);
-            tma::expect_bytes(inputs_arrived[stage], num_tokens_per_stage * sizeof(globals_fwd_epilogue::token_vec));
+            tma::expect_bytes(inputs_arrived[stage], num_tokens_per_stage * sizeof(typename globals::token_vec));
         }
     }
     for (int i = tid; i < TOKENS_PER_CTA * topk; i += blockDim.x)
@@ -100,8 +105,8 @@ static __device__ __forceinline__ void fwd_epilogue_kernel(const globals_fwd_epi
 
     #pragma unroll
     for (int stage = 0; stage < TOKENS_PER_CTA; ++stage) {
-        globals_fwd_epilogue::token_vec *stage_vecs = token_vecs + stage * num_tokens_per_stage;
-        rv_fl<globals_fwd_epilogue::Nb / config_fwd_epilogue::NUM_WARPS> accumulator, term;
+        typename globals::token_vec *stage_vecs = token_vecs + stage * num_tokens_per_stage;
+        rv_fl<globals::Nb / config_fwd_epilogue::NUM_WARPS> accumulator, term;
         wait(inputs_arrived[stage], 0);
         compute_group::load(accumulator, stage_vecs[0]);
         for (int k = 0; k < topk; ++k) {
@@ -116,20 +121,65 @@ static __device__ __forceinline__ void fwd_epilogue_kernel(const globals_fwd_epi
     }
 }
 
-static __host__ at::Tensor fwd_epilogue(
+template<int NB, int TOKENS_PER_CTA>
+static __host__ at::Tensor fwd_epilogue_launch(
     const at::Tensor &y_shared,
     const at::Tensor &combine_buffer,
     const at::Tensor &topk_weights
 ) {
+    using globals = globals_fwd_epilogue<NB, TOKENS_PER_CTA>;
+    TORCH_CHECK(y_shared.size(0) % TOKENS_PER_CTA == 0,
+                "the number of tokens must be divisible by tokens_per_cta");
     at::Tensor output = at::empty_like(y_shared);
-    globals_fwd_epilogue g {
-        .y_shared = kittens::py::tensor_to_gl<globals_fwd_epilogue::activation_gl>(y_shared),
-        .combine_buffer = kittens::py::tensor_to_gl<globals_fwd_epilogue::activation_gl>(combine_buffer),
-        .topk_weights = kittens::py::tensor_to_gl<globals_fwd_epilogue::weight_gl>(topk_weights),
-        .output = kittens::py::tensor_to_gl<globals_fwd_epilogue::activation_gl>(output)
+    globals g {
+        .y_shared = kittens::py::tensor_to_gl<typename globals::activation_gl>(y_shared),
+        .combine_buffer = kittens::py::tensor_to_gl<typename globals::activation_gl>(combine_buffer),
+        .topk_weights = kittens::py::tensor_to_gl<typename globals::weight_gl>(topk_weights),
+        .output = kittens::py::tensor_to_gl<typename globals::activation_gl>(output)
     };
-    kittens::py::launch_kernel<config_fwd_epilogue, globals_fwd_epilogue, fwd_epilogue_kernel>(g);
+    kittens::py::launch_kernel<
+        config_fwd_epilogue,
+        globals,
+        fwd_epilogue_kernel<NB, TOKENS_PER_CTA>
+    >(g);
     return output;
+}
+
+template<int NB>
+static __host__ at::Tensor fwd_epilogue_cols(
+    const at::Tensor &y_shared,
+    const at::Tensor &combine_buffer,
+    const at::Tensor &topk_weights,
+    const int tokens_per_cta
+) {
+    switch (tokens_per_cta) {
+        case 1: return fwd_epilogue_launch<NB, 1>(y_shared, combine_buffer, topk_weights);
+        case 2: return fwd_epilogue_launch<NB, 2>(y_shared, combine_buffer, topk_weights);
+        case 4: return fwd_epilogue_launch<NB, 4>(y_shared, combine_buffer, topk_weights);
+        case 8: return fwd_epilogue_launch<NB, 8>(y_shared, combine_buffer, topk_weights);
+        default: TORCH_CHECK(false, "tokens_per_cta must be 1, 2, 4, or 8");
+    }
+}
+
+static __host__ at::Tensor fwd_epilogue(
+    const at::Tensor &y_shared,
+    const at::Tensor &combine_buffer,
+    const at::Tensor &topk_weights,
+    const int tokens_per_cta,
+    const int cols_per_cta
+) {
+    const int selected_cols = cols_per_cta == 0
+        ? (y_shared.size(1) % 1280 == 0 ? 1280 : 1024)
+        : cols_per_cta;
+    switch (selected_cols) {
+        case 1024: return fwd_epilogue_cols<1024>(
+            y_shared, combine_buffer, topk_weights, tokens_per_cta);
+        case 1280: return fwd_epilogue_cols<1280>(
+            y_shared, combine_buffer, topk_weights, tokens_per_cta);
+        case 2560: return fwd_epilogue_cols<2560>(
+            y_shared, combine_buffer, topk_weights, tokens_per_cta);
+        default: TORCH_CHECK(false, "cols_per_cta must be 0, 1024, 1280, or 2560");
+    }
 }
 
 struct config_bwd_epilogue {

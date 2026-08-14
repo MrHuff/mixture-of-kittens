@@ -387,6 +387,7 @@ def combine_bf16_into(
     row_start: int,
     num_rows: int,
     num_comm_sms: int,
+    combine_cols: int = 0,
 ) -> None:
     """Pushes one expert-ordered BF16 row range back to source-token routes."""
     if (not input.is_cuda or input.dtype != torch.bfloat16
@@ -426,6 +427,12 @@ def combine_bf16_into(
         raise ValueError("combine row range must be positive, 16-aligned, and in bounds")
     if type(num_comm_sms) is not int or num_comm_sms <= 0:
         raise ValueError("num_comm_sms must be a positive integer")
+    if type(combine_cols) is not int or combine_cols not in (
+        0, 512, 640, 768, 1024, 1280, 2560,
+    ):
+        raise ValueError(
+            "combine_cols must be 0, 512, 640, 768, 1024, 1280, or 2560"
+        )
     _C.combine_bf16_into(
         input,
         local_output,
@@ -436,6 +443,7 @@ def combine_bf16_into(
         row_start,
         num_rows,
         num_comm_sms,
+        combine_cols,
     )
 
 
@@ -1261,6 +1269,8 @@ def fwd_epilogue(
     y_shared: torch.Tensor,
     combine_buffer: torch.Tensor,
     topk_weights: torch.Tensor,
+    tokens_per_cta: int = 2,
+    cols_per_cta: int = 0,
 ) -> torch.Tensor:
     """Combines shared and router-weighted routed expert outputs.
 
@@ -1268,6 +1278,8 @@ def fwd_epilogue(
         y_shared:       bfloat16 [num_local_tokens, hidden_size]
         combine_buffer: bfloat16 [num_local_tokens * topk, hidden_size]
         topk_weights:   float32 [num_local_tokens, topk]
+        tokens_per_cta: number of tokens grouped in each CTA
+        cols_per_cta:   hidden columns covered by each CTA; zero selects automatically
 
     Outputs:
         output: bfloat16 [num_local_tokens, hidden_size]
@@ -1277,6 +1289,12 @@ def fwd_epilogue(
     num_local_tokens, hidden_size = y_shared.shape
     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
+    if type(tokens_per_cta) is not int or tokens_per_cta not in (1, 2, 4, 8):
+        raise ValueError("tokens_per_cta must be 1, 2, 4, or 8")
+    if num_local_tokens % tokens_per_cta:
+        raise ValueError("num_local_tokens must be divisible by tokens_per_cta")
+    if type(cols_per_cta) is not int or cols_per_cta not in (0, 1024, 1280, 2560):
+        raise ValueError("cols_per_cta must be 0, 1024, 1280, or 2560")
     if hidden_size <= 0 or hidden_size % 256 != 0:
         raise ValueError("hidden_size must be positive and divisible by 256")
     if (topk_weights.device != y_shared.device
@@ -1287,10 +1305,32 @@ def fwd_epilogue(
     topk = topk_weights.shape[1]
     if not 0 < topk <= 255:
         raise ValueError("topk must be in [1, 255]")
+    selected_cols_per_cta = (
+        1280 if cols_per_cta == 0 and hidden_size % 1280 == 0
+        else 1024 if cols_per_cta == 0
+        else cols_per_cta
+    )
+    dynamic_smem = tokens_per_cta * (
+        (topk + 1) * selected_cols_per_cta * y_shared.element_size()
+        + topk * topk_weights.element_size()
+    ) + 1024
+    max_dynamic_smem = torch.cuda.get_device_properties(
+        y_shared.device
+    ).shared_memory_per_block_optin
+    if dynamic_smem > max_dynamic_smem:
+        raise ValueError(
+            "tokens_per_cta and cols_per_cta require too much dynamic shared memory"
+        )
     if tuple(combine_buffer.shape) != (num_local_tokens * topk, hidden_size):
         raise ValueError("combine_buffer must have shape (num_local_tokens * topk, hidden_size)")
 
-    return _C.fwd_epilogue(y_shared, combine_buffer, topk_weights)
+    return _C.fwd_epilogue(
+        y_shared,
+        combine_buffer,
+        topk_weights,
+        tokens_per_cta,
+        cols_per_cta,
+    )
 
 
 @torch.library.custom_op("mok::bwd_epilogue", mutates_args=())

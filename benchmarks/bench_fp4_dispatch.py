@@ -15,7 +15,7 @@ from mok import functional, ops
 
 _DEEPSEEK_ROOT = Path(__file__).resolve().parents[2]
 _FP4_ROOT = Path(os.environ.get("FP4_MATMUL_ROOT", _DEEPSEEK_ROOT / "fp4_matmul"))
-_MXFP4_GEMM_MAX_BATCHES = 32
+_MXFP4_GEMM_MAX_BATCHES = 40
 _NVFP4_GEMM_MAX_BATCHES = 40
 
 
@@ -61,7 +61,7 @@ def _parse_args() -> argparse.Namespace:
         default=0,
         help="routed expert hidden size; zero skips routed-MLP integration",
     )
-    parser.add_argument("--comm-sms", type=int, default=120)
+    parser.add_argument("--comm-sms", type=int, default=148)
     parser.add_argument(
         "--overlap-comm-sms",
         type=int,
@@ -71,7 +71,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--combine-sms",
         type=int,
-        default=120,
+        default=136,
         help="communication SMs used to push routed BF16 outputs back to source ranks",
     )
     parser.add_argument(
@@ -80,9 +80,62 @@ def _parse_args() -> argparse.Namespace:
         help="optional comma-separated push-SM values for integrated pipeline timing",
     )
     parser.add_argument(
+        "--combine-cols",
+        type=int,
+        choices=(0, 512, 640, 768, 1024, 1280, 2560),
+        default=0,
+        help="BF16 route-push columns handled by each combine tile; zero selects automatically",
+    )
+    parser.add_argument(
+        "--sweep-combine-cols",
+        default="",
+        help="optional comma-separated route-push combine tile widths",
+    )
+    parser.add_argument(
         "--sweep-comm-sms",
         default="",
         help="optional comma-separated communication-SM values for raw-kernel timing",
+    )
+    parser.add_argument(
+        "--sweep-mxfp4-gemm-configs",
+        default="",
+        help="optional comma-separated MXFP4 batched-GEMM config IDs",
+    )
+    parser.add_argument(
+        "--mxfp4-pull-cols",
+        type=int,
+        choices=(0, 512, 640, 768, 896),
+        default=0,
+        help="MXFP4 dispatch pull width; zero uses the production default",
+    )
+    parser.add_argument(
+        "--sweep-mxfp4-pull-cols",
+        default="",
+        help="optional comma-separated MXFP4 dispatch pull widths",
+    )
+    parser.add_argument(
+        "--epilogue-tokens-per-cta",
+        type=int,
+        choices=(1, 2, 4, 8),
+        default=2,
+        help="tokens grouped in each full-MoE epilogue CTA",
+    )
+    parser.add_argument(
+        "--sweep-epilogue-tokens-per-cta",
+        default="",
+        help="optional comma-separated epilogue token group sizes",
+    )
+    parser.add_argument(
+        "--epilogue-cols-per-cta",
+        type=int,
+        choices=(0, 1024, 1280, 2560),
+        default=0,
+        help="hidden columns covered by each full-MoE epilogue CTA; zero selects automatically",
+    )
+    parser.add_argument(
+        "--sweep-epilogue-cols-per-cta",
+        default="",
+        help="optional comma-separated epilogue column tile sizes",
     )
     parser.add_argument("--correctness-repeats", type=int, default=3)
     parser.add_argument(
@@ -166,6 +219,94 @@ def _combine_sms_sweep(args: argparse.Namespace) -> list[int]:
             ) from error
     if any(value <= 0 for value in values):
         raise ValueError("all combine-SM sweep values must be positive")
+    return list(dict.fromkeys(values))
+
+
+def _combine_cols_sweep(args: argparse.Namespace) -> list[int]:
+    if not args.sweep_combine_cols:
+        return []
+    try:
+        values = [int(value) for value in args.sweep_combine_cols.split(",")]
+    except ValueError as error:
+        raise ValueError(
+            "--sweep-combine-cols must be comma-separated integers"
+        ) from error
+    supported = {512, 640, 768, 1024, 1280, 2560}
+    if any(value not in supported for value in values):
+        raise ValueError(
+            "combine widths must be 512, 640, 768, 1024, 1280, or 2560"
+        )
+    return list(dict.fromkeys(values))
+
+
+def _mxfp4_gemm_config_sweep(args: argparse.Namespace) -> list[int]:
+    if not args.sweep_mxfp4_gemm_configs:
+        return []
+    try:
+        values = [
+            int(value) for value in args.sweep_mxfp4_gemm_configs.split(",")
+        ]
+    except ValueError as error:
+        raise ValueError(
+            "--sweep-mxfp4-gemm-configs must be comma-separated integers"
+        ) from error
+    if any(value < 0 or value > 9 for value in values):
+        raise ValueError("MXFP4 batched-GEMM config IDs must be in [0, 9]")
+    return list(dict.fromkeys(values))
+
+
+def _mxfp4_pull_cols_sweep(args: argparse.Namespace) -> list[int]:
+    if not args.sweep_mxfp4_pull_cols:
+        return []
+    try:
+        values = [
+            int(value) for value in args.sweep_mxfp4_pull_cols.split(",")
+        ]
+    except ValueError as error:
+        raise ValueError(
+            "--sweep-mxfp4-pull-cols must be comma-separated integers"
+        ) from error
+    supported = {512, 640, 768, 896}
+    if any(value not in supported for value in values):
+        raise ValueError(
+            "MXFP4 dispatch pull widths must be 512, 640, 768, or 896"
+        )
+    return list(dict.fromkeys(values))
+
+
+def _epilogue_tokens_per_cta_sweep(args: argparse.Namespace) -> list[int]:
+    if not args.sweep_epilogue_tokens_per_cta:
+        return []
+    try:
+        values = [
+            int(value)
+            for value in args.sweep_epilogue_tokens_per_cta.split(",")
+        ]
+    except ValueError as error:
+        raise ValueError(
+            "--sweep-epilogue-tokens-per-cta must be comma-separated integers"
+        ) from error
+    supported = {1, 2, 4, 8}
+    if any(value not in supported for value in values):
+        raise ValueError("epilogue tokens per CTA must be 1, 2, 4, or 8")
+    return list(dict.fromkeys(values))
+
+
+def _epilogue_cols_per_cta_sweep(args: argparse.Namespace) -> list[int]:
+    if not args.sweep_epilogue_cols_per_cta:
+        return []
+    try:
+        values = [
+            int(value)
+            for value in args.sweep_epilogue_cols_per_cta.split(",")
+        ]
+    except ValueError as error:
+        raise ValueError(
+            "--sweep-epilogue-cols-per-cta must be comma-separated integers"
+        ) from error
+    supported = {1024, 1280, 2560}
+    if any(value not in supported for value in values):
+        raise ValueError("epilogue columns per CTA must be 1024, 1280, or 2560")
     return list(dict.fromkeys(values))
 
 
@@ -364,6 +505,11 @@ def main() -> None:
     comm_sms_sweep = _comm_sms_sweep(args)
     pipeline_group_sweep = _pipeline_group_sweep(args)
     combine_sms_sweep = _combine_sms_sweep(args)
+    combine_cols_sweep = _combine_cols_sweep(args)
+    mxfp4_gemm_config_sweep = _mxfp4_gemm_config_sweep(args)
+    mxfp4_pull_cols_sweep = _mxfp4_pull_cols_sweep(args)
+    epilogue_tokens_per_cta_sweep = _epilogue_tokens_per_cta_sweep(args)
+    epilogue_cols_per_cta_sweep = _epilogue_cols_per_cta_sweep(args)
     mxfp4_quant, nvfp4_quant = _load_production_quantizers()
 
     min_schedule_factor = (
@@ -640,6 +786,20 @@ def main() -> None:
             num_tokens, args.hidden, dtype=torch.bfloat16, device=device
         )
         routed_nvfp4 = torch.empty_like(routed_mxfp4)
+        hidden_mxfp4 = torch.empty(
+            num_tokens,
+            args.expert_hidden // 2,
+            dtype=torch.float4_e2m1fn_x2,
+            device=device,
+        )
+        hidden_mxfp4_scales = torch.empty(
+            num_tokens // 128,
+            args.expert_hidden // 128,
+            32,
+            16,
+            dtype=torch.uint8,
+            device=device,
+        )
 
         active_starts = [expert_starts[expert] for expert in active_experts]
         active_rows = [expert_rows[expert] for expert in active_experts]
@@ -675,6 +835,7 @@ def main() -> None:
             quantized: tuple[torch.Tensor, torch.Tensor],
             expert_begin: int = 0,
             expert_end: int | None = None,
+            config_id: int = -1,
         ) -> torch.Tensor:
             if expert_end is None:
                 expert_end = len(active_experts)
@@ -701,6 +862,7 @@ def main() -> None:
                     active_rows[batch],
                     gate_up_sizes[batch],
                     hidden_sizes[batch],
+                    config_id,
                 )
             return gate_up_mxfp4
 
@@ -788,6 +950,7 @@ def main() -> None:
             expert_begin: int = 0,
             expert_end: int | None = None,
             row_base: int = 0,
+            config_id: int = -1,
         ) -> torch.Tensor:
             if expert_end is None:
                 expert_end = len(active_experts)
@@ -817,6 +980,7 @@ def main() -> None:
                     active_rows[batch],
                     down_output_sizes[batch],
                     expert_hidden_sizes[batch],
+                    config_id,
                 )
             return routed_mxfp4
 
@@ -895,16 +1059,23 @@ def main() -> None:
             if row_count is None:
                 row_count = num_tokens - row_start
             run_mxfp4_gate_up(quantized, expert_begin, expert_end)
-            hidden_quantized = (
-                mxfp4_quant.mxfp4_fused_silu_mul_quantize_row_and_col_strided(
-                    gate_up_mxfp4.narrow(0, row_start, row_count),
-                    args.expert_hidden,
-                    args.expert_hidden,
-                    1,
-                )
+            hidden_data = hidden_mxfp4.narrow(0, row_start, row_count)
+            hidden_scales = hidden_mxfp4_scales.narrow(
+                0, row_start // 128, row_count // 128
+            )
+            mxfp4_quant.mxfp4_fused_silu_mul_quantize_row_strided_launch_inplace(
+                gate_up_mxfp4.narrow(0, row_start, row_count),
+                args.expert_hidden,
+                args.expert_hidden,
+                hidden_data,
+                hidden_scales,
+                1,
             )
             return run_mxfp4_down(
-                hidden_quantized, expert_begin, expert_end, row_start
+                (hidden_data, hidden_scales),
+                expert_begin,
+                expert_end,
+                row_start,
             )
 
         def run_nvfp4_routed_mlp(
@@ -1012,13 +1183,17 @@ def main() -> None:
         }
 
         overlap_comm_sms = args.overlap_comm_sms or args.comm_sms
+        mok_c = importlib.import_module("mok._C")
 
         def dispatch_mxfp4_range(
             row_start: int,
             row_count: int,
             num_comm_sms: int = args.comm_sms,
+            pull_cols: int | None = None,
         ) -> None:
-            ops.dispatch_mxfp4_into(
+            if pull_cols is None:
+                pull_cols = args.mxfp4_pull_cols
+            dispatch_args = (
                 workspace.x_buffer,
                 workspace.x_buffer_ptrs,
                 schedule.peer_rank,
@@ -1031,6 +1206,10 @@ def main() -> None:
                 workspace.topk,
                 num_comm_sms,
             )
+            if pull_cols:
+                mok_c.dispatch_mxfp4_into(*dispatch_args, pull_cols)
+            else:
+                ops.dispatch_mxfp4_into(*dispatch_args)
 
         def dispatch_nvfp4_range(
             row_start: int,
@@ -1057,6 +1236,7 @@ def main() -> None:
             row_start: int,
             row_count: int,
             num_comm_sms: int = args.combine_sms,
+            combine_cols: int = args.combine_cols,
         ) -> None:
             ops.combine_bf16_into(
                 routed_output,
@@ -1068,6 +1248,7 @@ def main() -> None:
                 row_start,
                 row_count,
                 num_comm_sms,
+                combine_cols,
             )
 
         def finish_combine() -> torch.Tensor:
@@ -1079,8 +1260,10 @@ def main() -> None:
             )
             return workspace.combine_buffer
 
-        def run_mxfp4_serial_into() -> torch.Tensor:
-            dispatch_mxfp4_range(0, num_tokens)
+        def run_mxfp4_serial_into(
+            pull_cols: int | None = None,
+        ) -> torch.Tensor:
+            dispatch_mxfp4_range(0, num_tokens, pull_cols=pull_cols)
             return run_mxfp4_routed_mlp(pipelined_mxfp4)
 
         def run_nvfp4_serial_into() -> torch.Tensor:
@@ -1090,21 +1273,27 @@ def main() -> None:
         def run_combine_only(
             routed_output: torch.Tensor,
             combine_sms: int = args.combine_sms,
+            combine_cols: int = args.combine_cols,
         ) -> torch.Tensor:
-            combine_range(routed_output, 0, num_tokens, combine_sms)
+            combine_range(
+                routed_output, 0, num_tokens, combine_sms, combine_cols
+            )
             return finish_combine()
 
         def run_mxfp4_serial_with_combine(
             combine_sms: int = args.combine_sms,
+            pull_cols: int | None = None,
+            combine_cols: int = args.combine_cols,
         ) -> torch.Tensor:
-            run_mxfp4_serial_into()
-            return run_combine_only(routed_mxfp4, combine_sms)
+            run_mxfp4_serial_into(pull_cols)
+            return run_combine_only(routed_mxfp4, combine_sms, combine_cols)
 
         def run_nvfp4_serial_with_combine(
             combine_sms: int = args.combine_sms,
+            combine_cols: int = args.combine_cols,
         ) -> torch.Tensor:
             run_nvfp4_serial_into()
-            return run_combine_only(routed_nvfp4, combine_sms)
+            return run_combine_only(routed_nvfp4, combine_sms, combine_cols)
 
         def run_mxfp4_streamed(
             group_count: int,
@@ -1205,8 +1394,16 @@ def main() -> None:
         def run_full_moe(
             run_routed: Callable[[int], torch.Tensor],
             combine_sms: int = args.combine_sms,
+            launch_shared_early: bool = True,
+            epilogue_tokens_per_cta: int = args.epilogue_tokens_per_cta,
+            epilogue_cols_per_cta: int = args.epilogue_cols_per_cta,
         ) -> torch.Tensor:
             current_stream = torch.cuda.current_stream(device)
+            if launch_shared_early:
+                shared_stream.wait_stream(current_stream)
+                with torch.cuda.stream(shared_stream):
+                    shared_output = run_bf16_shared_mlp()
+                    shared_done.record()
             workspace.x_buffer.copy_(x)
             ops.barrier_all(
                 workspace.barrier_buffer,
@@ -1214,25 +1411,50 @@ def main() -> None:
                 workspace.barrier_buffer_multicast_ptr,
                 workspace.barrier_target,
             )
-            shared_stream.wait_stream(current_stream)
-            with torch.cuda.stream(shared_stream):
-                shared_output = run_bf16_shared_mlp()
-                shared_done.record()
+            if not launch_shared_early:
+                shared_stream.wait_stream(current_stream)
+                with torch.cuda.stream(shared_stream):
+                    shared_output = run_bf16_shared_mlp()
+                    shared_done.record()
             run_routed(combine_sms)
             current_stream.wait_event(shared_done)
             return ops.fwd_epilogue(
-                shared_output, workspace.combine_buffer, router_weights
+                shared_output,
+                workspace.combine_buffer,
+                router_weights,
+                epilogue_tokens_per_cta,
+                epilogue_cols_per_cta,
             )
 
         def run_mxfp4_full_moe(
             combine_sms: int = args.combine_sms,
+            pull_cols: int | None = None,
+            epilogue_tokens_per_cta: int = args.epilogue_tokens_per_cta,
+            epilogue_cols_per_cta: int = args.epilogue_cols_per_cta,
+            combine_cols: int = args.combine_cols,
         ) -> torch.Tensor:
-            return run_full_moe(run_mxfp4_serial_with_combine, combine_sms)
+            return run_full_moe(
+                lambda sms: run_mxfp4_serial_with_combine(
+                    sms, pull_cols, combine_cols
+                ),
+                combine_sms,
+                epilogue_tokens_per_cta=epilogue_tokens_per_cta,
+                epilogue_cols_per_cta=epilogue_cols_per_cta,
+            )
 
         def run_nvfp4_full_moe(
             combine_sms: int = args.combine_sms,
+            epilogue_tokens_per_cta: int = args.epilogue_tokens_per_cta,
+            epilogue_cols_per_cta: int = args.epilogue_cols_per_cta,
+            combine_cols: int = args.combine_cols,
         ) -> torch.Tensor:
-            return run_full_moe(run_nvfp4_serial_with_combine, combine_sms)
+            return run_full_moe(
+                lambda sms: run_nvfp4_serial_with_combine(sms, combine_cols),
+                combine_sms,
+                launch_shared_early=False,
+                epilogue_tokens_per_cta=epilogue_tokens_per_cta,
+                epilogue_cols_per_cta=epilogue_cols_per_cta,
+            )
 
         validation_groups = pipeline_specs[max(pipeline_specs)]
         for _, _, row_start, row_count in validation_groups:
@@ -1247,6 +1469,20 @@ def main() -> None:
             pipelined_mxfp4[1][:num_tokens // 128],
             actual_mxfp4[1][:num_tokens // 128],
         )
+        for pull_cols in mxfp4_pull_cols_sweep:
+            dispatch_mxfp4_range(
+                0, num_tokens, pull_cols=pull_cols
+            )
+            _assert_exact(
+                f"MXFP4 {pull_cols}-column dispatch data",
+                _as_bytes(pipelined_mxfp4[0])[:num_tokens],
+                _as_bytes(actual_mxfp4[0])[:num_tokens],
+            )
+            _assert_exact(
+                f"MXFP4 {pull_cols}-column dispatch scales",
+                pipelined_mxfp4[1][:num_tokens // 128],
+                actual_mxfp4[1][:num_tokens // 128],
+            )
         for _, _, row_start, row_count in validation_groups:
             dispatch_nvfp4_range(row_start, row_count)
         _assert_exact(
@@ -1321,6 +1557,32 @@ def main() -> None:
         )
         _assert_exact(
             "NVFP4 gate/up repeat", gate_up_nvfp4[gemm_sample_rows], nvfp4_sample
+        )
+        hidden_mxfp4_rowcol = (
+            mxfp4_quant.mxfp4_fused_silu_mul_quantize_row_and_col_strided(
+                gate_up_mxfp4,
+                args.expert_hidden,
+                args.expert_hidden,
+                1,
+            )
+        )
+        hidden_mxfp4_row = (
+            mxfp4_quant.mxfp4_fused_silu_mul_quantize_row_strided(
+                gate_up_mxfp4,
+                args.expert_hidden,
+                args.expert_hidden,
+                1,
+            )
+        )
+        _assert_exact(
+            "MXFP4 row-only fused SwiGLU data",
+            _as_bytes(hidden_mxfp4_row[0]),
+            _as_bytes(hidden_mxfp4_rowcol[0]),
+        )
+        _assert_exact(
+            "MXFP4 row-only fused SwiGLU scales",
+            hidden_mxfp4_row[1],
+            hidden_mxfp4_rowcol[1],
         )
         run_mxfp4_routed_mlp(actual_mxfp4)
         run_nvfp4_routed_mlp(actual_nvfp4)
@@ -1449,11 +1711,25 @@ def main() -> None:
         mxfp4_combine_sample = workspace.combine_buffer[
             combine_sample_routes
         ].clone()
+        mxfp4_expected_combine = expected_combine_samples(routed_mxfp4)
         _assert_exact(
             "MXFP4 streamed push combine",
             mxfp4_combine_sample,
-            expected_combine_samples(routed_mxfp4),
+            mxfp4_expected_combine,
         )
+        for combine_cols in combine_cols_sweep:
+            workspace.combine_buffer.fill_(float("nan"))
+            dist.barrier(async_op=True).block_current_stream()
+            run_combine_only(
+                routed_mxfp4,
+                args.combine_sms,
+                combine_cols,
+            )
+            _assert_exact(
+                f"MXFP4 {combine_cols}-column route push",
+                workspace.combine_buffer[combine_sample_routes],
+                mxfp4_expected_combine,
+            )
 
         workspace.combine_buffer.fill_(float("nan"))
         dist.barrier(async_op=True).block_current_stream()
@@ -1490,6 +1766,39 @@ def main() -> None:
             raise AssertionError(
                 "FP4 full MoE assembly relative RMS error too large: "
                 f"{full_moe_relative_rms}"
+            )
+
+        epilogue_shared_output = run_bf16_shared_mlp()
+        epilogue_reference = ops.fwd_epilogue(
+            epilogue_shared_output,
+            workspace.combine_buffer,
+            router_weights,
+            args.epilogue_tokens_per_cta,
+            args.epilogue_cols_per_cta,
+        )
+        for tokens_per_cta in epilogue_tokens_per_cta_sweep:
+            _assert_exact(
+                f"Epilogue {tokens_per_cta} tokens/CTA",
+                ops.fwd_epilogue(
+                    epilogue_shared_output,
+                    workspace.combine_buffer,
+                    router_weights,
+                    tokens_per_cta,
+                    args.epilogue_cols_per_cta,
+                ),
+                epilogue_reference,
+            )
+        for cols_per_cta in epilogue_cols_per_cta_sweep:
+            _assert_exact(
+                f"Epilogue {cols_per_cta} columns/CTA",
+                ops.fwd_epilogue(
+                    epilogue_shared_output,
+                    workspace.combine_buffer,
+                    router_weights,
+                    args.epilogue_tokens_per_cta,
+                    cols_per_cta,
+                ),
+                epilogue_reference,
             )
 
         def run_mxfp4_pipeline() -> torch.Tensor:
@@ -1533,6 +1842,98 @@ def main() -> None:
                 num_comm_sms=args.comm_sms,
             )
             return run_nvfp4_routed_mlp(quantized)
+
+        if mxfp4_gemm_config_sweep:
+            run_mxfp4_gate_up(actual_mxfp4)
+            mxfp4_quant.mxfp4_fused_silu_mul_quantize_row_strided_launch_inplace(
+                gate_up_mxfp4,
+                args.expert_hidden,
+                args.expert_hidden,
+                hidden_mxfp4,
+                hidden_mxfp4_scales,
+                1,
+            )
+            sweep_hidden_mxfp4 = (hidden_mxfp4, hidden_mxfp4_scales)
+            for config_id in mxfp4_gemm_config_sweep:
+                gemm_variants.extend(
+                    (
+                        (
+                            f"MXFP4 gate/up GEMM config {config_id}",
+                            lambda config_id=config_id: run_mxfp4_gate_up(
+                                actual_mxfp4, config_id=config_id
+                            ),
+                        ),
+                        (
+                            f"MXFP4 down GEMM config {config_id}",
+                            lambda config_id=config_id: run_mxfp4_down(
+                                sweep_hidden_mxfp4, config_id=config_id
+                            ),
+                        ),
+                    )
+                )
+
+        gemm_variants.append(
+            (
+                "MXFP4 row-only SwiGLU quant",
+                lambda: mxfp4_quant.mxfp4_fused_silu_mul_quantize_row_strided_launch_inplace(
+                    gate_up_mxfp4,
+                    args.expert_hidden,
+                    args.expert_hidden,
+                    hidden_mxfp4,
+                    hidden_mxfp4_scales,
+                    1,
+                ),
+            )
+        )
+
+        for tokens_per_cta in epilogue_tokens_per_cta_sweep:
+            gemm_variants.extend(
+                (
+                    (
+                        f"Isolated epilogue ({tokens_per_cta} tokens/CTA)",
+                        lambda tokens_per_cta=tokens_per_cta: ops.fwd_epilogue(
+                            epilogue_shared_output,
+                            workspace.combine_buffer,
+                            router_weights,
+                            tokens_per_cta,
+                            args.epilogue_cols_per_cta,
+                        ),
+                    ),
+                    (
+                        f"MXFP4 full MoE epilogue {tokens_per_cta} tokens/CTA",
+                        lambda tokens_per_cta=tokens_per_cta: run_mxfp4_full_moe(
+                            args.combine_sms,
+                            None,
+                            tokens_per_cta,
+                        ),
+                    ),
+                )
+            )
+
+        for cols_per_cta in epilogue_cols_per_cta_sweep:
+            gemm_variants.extend(
+                (
+                    (
+                        f"Isolated epilogue ({cols_per_cta} columns/CTA)",
+                        lambda cols_per_cta=cols_per_cta: ops.fwd_epilogue(
+                            epilogue_shared_output,
+                            workspace.combine_buffer,
+                            router_weights,
+                            args.epilogue_tokens_per_cta,
+                            cols_per_cta,
+                        ),
+                    ),
+                    (
+                        f"MXFP4 full MoE epilogue {cols_per_cta} columns/CTA",
+                        lambda cols_per_cta=cols_per_cta: run_mxfp4_full_moe(
+                            args.combine_sms,
+                            None,
+                            args.epilogue_tokens_per_cta,
+                            cols_per_cta,
+                        ),
+                    ),
+                )
+            )
 
         gemm_variants.extend(
             (
@@ -1585,6 +1986,34 @@ def main() -> None:
                         f"{args.comm_sms}/{overlap_comm_sms} SM)",
                         lambda group_count=group_count: run_nvfp4_streamed(
                             group_count
+                        ),
+                    ),
+                )
+            )
+        for pull_cols in mxfp4_pull_cols_sweep:
+            gemm_variants.append(
+                (
+                    f"MXFP4 full MoE pull-cols {pull_cols}",
+                    lambda pull_cols=pull_cols: run_mxfp4_full_moe(
+                        args.combine_sms, pull_cols
+                    ),
+                )
+            )
+        for combine_cols in combine_cols_sweep:
+            gemm_variants.extend(
+                (
+                    (
+                        f"BF16 route push combine-cols {combine_cols}",
+                        lambda combine_cols=combine_cols: run_combine_only(
+                            routed_mxfp4,
+                            args.combine_sms,
+                            combine_cols,
+                        ),
+                    ),
+                    (
+                        f"MXFP4 full MoE combine-cols {combine_cols}",
+                        lambda combine_cols=combine_cols: run_mxfp4_full_moe(
+                            combine_cols=combine_cols
                         ),
                     ),
                 )
@@ -1731,7 +2160,11 @@ def main() -> None:
             f"experts={args.experts} topk={args.topk} H={args.hidden} "
             f"comm_sms={args.comm_sms} "
             f"overlap_comm_sms={overlap_comm_sms if args.expert_hidden else 'n/a'} "
-            f"combine_sms={args.combine_sms if args.expert_hidden else 'n/a'}"
+            f"combine_sms={args.combine_sms if args.expert_hidden else 'n/a'} "
+            f"combine_cols={(args.combine_cols or 'auto') if args.expert_hidden else 'n/a'} "
+            f"mxfp4_pull_cols={args.mxfp4_pull_cols or 'default'} "
+            f"epilogue_tokens_per_cta={args.epilogue_tokens_per_cta} "
+            f"epilogue_cols_per_cta={args.epilogue_cols_per_cta or 'auto'}"
         )
         print(
             f"Bit-exact on {sample_count} sampled rows against an independent "
