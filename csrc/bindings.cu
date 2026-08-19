@@ -38,7 +38,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("num_tokens"), pybind11::arg("global_scale"),
           pybind11::arg("output"), pybind11::arg("scales"),
           pybind11::arg("row_start"), pybind11::arg("num_rows"),
-          pybind11::arg("topk"), pybind11::arg("num_comm_sms"));
+          pybind11::arg("topk"), pybind11::arg("num_comm_sms"),
+          pybind11::arg("pull_cols") = fp4_dispatch::DEFAULT_PULL_COLS);
     m.def("combine_bf16_into", &fp4_dispatch::combine_bf16_into, "",
           pybind11::arg("input"), pybind11::arg("local_output"),
           pybind11::arg("output_ptrs"),

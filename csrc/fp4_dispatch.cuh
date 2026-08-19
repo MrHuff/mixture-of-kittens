@@ -585,11 +585,12 @@ static __host__ inline void dispatch_nvfp4_into(
     int64_t row_start,
     int64_t num_rows,
     int topk,
-    int num_comm_sms
+    int num_comm_sms,
+    int pull_cols = DEFAULT_PULL_COLS
 ) {
     launch_into<true>(x, x_ptrs, schedule_peer_rank, schedule_peer_token_idx,
                       num_tokens, global_scale, output, scales, row_start,
-                      num_rows, topk, num_comm_sms);
+                      num_rows, topk, num_comm_sms, pull_cols);
 }
 
 static __host__ inline void combine_bf16_into(

@@ -119,6 +119,11 @@ def _parse_args() -> argparse.Namespace:
         help="optional comma-separated MXFP4 dispatch pull widths",
     )
     parser.add_argument(
+        "--sweep-nvfp4-pull-cols",
+        default="",
+        help="optional comma-separated NVFP4 dispatch pull widths",
+    )
+    parser.add_argument(
         "--epilogue-tokens-per-cta",
         type=int,
         choices=(1, 2, 4, 8),
@@ -291,6 +296,25 @@ def _mxfp4_pull_cols_sweep(args: argparse.Namespace) -> list[int]:
     if any(value not in supported for value in values):
         raise ValueError(
             "MXFP4 dispatch pull widths must be 512, 640, 768, or 896"
+        )
+    return list(dict.fromkeys(values))
+
+
+def _nvfp4_pull_cols_sweep(args: argparse.Namespace) -> list[int]:
+    if not args.sweep_nvfp4_pull_cols:
+        return []
+    try:
+        values = [
+            int(value) for value in args.sweep_nvfp4_pull_cols.split(",")
+        ]
+    except ValueError as error:
+        raise ValueError(
+            "--sweep-nvfp4-pull-cols must be comma-separated integers"
+        ) from error
+    supported = {512, 640, 768, 896}
+    if any(value not in supported for value in values):
+        raise ValueError(
+            "NVFP4 dispatch pull widths must be 512, 640, 768, or 896"
         )
     return list(dict.fromkeys(values))
 
@@ -530,6 +554,7 @@ def main() -> None:
     mxfp4_gemm_config_sweep = _mxfp4_gemm_config_sweep(args)
     nvfp4_gemm_config_sweep = _nvfp4_gemm_config_sweep(args)
     mxfp4_pull_cols_sweep = _mxfp4_pull_cols_sweep(args)
+    nvfp4_pull_cols_sweep = _nvfp4_pull_cols_sweep(args)
     epilogue_tokens_per_cta_sweep = _epilogue_tokens_per_cta_sweep(args)
     epilogue_cols_per_cta_sweep = _epilogue_cols_per_cta_sweep(args)
     mxfp4_quant, nvfp4_quant = _load_production_quantizers()
@@ -1493,6 +1518,39 @@ def main() -> None:
             nv_down_weight_global_scales,
             nv_down_outputs,
         )
+        cached_nvfp4_group_plans: dict[
+            int, list[tuple[object, object]]
+        ] = {}
+        for group_count, groups in pipeline_specs.items():
+            group_plans = []
+            for expert_begin, expert_end, _, _ in groups:
+                batch = slice(expert_begin, expert_end)
+                gate_plan = nvfp4_gemm.NVFP4BatchedGemmPlan(
+                    pipelined_nvfp4_views[0][batch],
+                    pipelined_nvfp4_views[1][batch],
+                    [
+                        nvfp4_global_scale
+                        for _ in range(expert_begin, expert_end)
+                    ],
+                    nv_weight_fp4[batch],
+                    nv_weight_scales[batch],
+                    nv_weight_global_scales[batch],
+                    nv_outputs[batch],
+                )
+                down_plan = nvfp4_gemm.NVFP4BatchedGemmPlan(
+                    cached_hidden_activation_fp4[batch],
+                    cached_hidden_activation_scales[batch],
+                    [
+                        cached_hidden_nvfp4[2]
+                        for _ in range(expert_begin, expert_end)
+                    ],
+                    nv_down_weight_fp4[batch],
+                    nv_down_weight_scales[batch],
+                    nv_down_weight_global_scales[batch],
+                    nv_down_outputs[batch],
+                )
+                group_plans.append((gate_plan, down_plan))
+            cached_nvfp4_group_plans[group_count] = group_plans
         comm_stream = torch.cuda.Stream(device=device)
         combine_stream = torch.cuda.Stream(device=device)
         shared_stream = torch.cuda.Stream(device=device)
@@ -1549,8 +1607,9 @@ def main() -> None:
             row_start: int,
             row_count: int,
             num_comm_sms: int = args.comm_sms,
+            pull_cols: int | None = None,
         ) -> None:
-            ops.dispatch_nvfp4_into(
+            dispatch_args = (
                 workspace.x_buffer,
                 workspace.x_buffer_ptrs,
                 schedule.peer_rank,
@@ -1564,6 +1623,10 @@ def main() -> None:
                 workspace.topk,
                 num_comm_sms,
             )
+            if pull_cols is None:
+                ops.dispatch_nvfp4_into(*dispatch_args)
+            else:
+                mok_c.dispatch_nvfp4_into(*dispatch_args, pull_cols)
 
         def combine_range(
             routed_output: torch.Tensor,
@@ -1745,6 +1808,69 @@ def main() -> None:
                 current_stream.wait_event(combine_done)
             return finish_combine()
 
+        def run_nvfp4_cached_streamed(
+            group_count: int,
+            push_output: bool = False,
+            combine_sms: int = args.combine_sms,
+        ) -> torch.Tensor:
+            current_stream = torch.cuda.current_stream(device)
+            comm_stream.wait_stream(current_stream)
+            if push_output:
+                combine_stream.wait_stream(current_stream)
+            events = zip(
+                pull_ready_events[group_count],
+                compute_ready_events[group_count],
+                combine_done_events[group_count],
+                pipeline_specs[group_count],
+                cached_nvfp4_group_plans[group_count],
+                strict=True,
+            )
+            for group_index, event_group in enumerate(events):
+                (
+                    pull_ready,
+                    compute_ready,
+                    combine_done,
+                    group,
+                    plans,
+                ) = event_group
+                _, _, row_start, row_count = group
+                gate_plan, down_plan = plans
+                with torch.cuda.stream(comm_stream):
+                    dispatch_nvfp4_range(
+                        row_start,
+                        row_count,
+                        args.comm_sms if group_index == 0 else overlap_comm_sms,
+                    )
+                    pull_ready.record()
+                current_stream.wait_event(pull_ready)
+                gate_plan.run()
+                nvfp4_quant.tk_silu_quantize_for_gemm_constant_scale_into(
+                    gate_up_nvfp4.narrow(0, row_start, row_count),
+                    args.expert_hidden,
+                    cached_hidden_nvfp4[0].narrow(
+                        0, row_start, row_count
+                    ),
+                    cached_hidden_nvfp4[1].narrow(
+                        0, row_start // 128, row_count // 128
+                    ),
+                    cached_hidden_nvfp4[2],
+                    cached_hidden_nvfp4_sync,
+                )
+                down_plan.run()
+                if push_output:
+                    compute_ready.record(current_stream)
+                    with torch.cuda.stream(combine_stream):
+                        combine_stream.wait_event(compute_ready)
+                        combine_range(
+                            routed_nvfp4, row_start, row_count, combine_sms
+                        )
+                        combine_done.record()
+            if not push_output:
+                return routed_nvfp4
+            for combine_done in combine_done_events[group_count]:
+                current_stream.wait_event(combine_done)
+            return finish_combine()
+
         def run_full_moe(
             run_routed: Callable[[int], torch.Tensor],
             combine_sms: int = args.combine_sms,
@@ -1833,6 +1959,20 @@ def main() -> None:
                 ),
             )
 
+        def run_nvfp4_cached_streamed_full_moe(
+            group_count: int,
+            combine_sms: int = args.combine_sms,
+        ) -> torch.Tensor:
+            return run_full_moe(
+                lambda sms: run_nvfp4_cached_streamed(
+                    group_count,
+                    push_output=True,
+                    combine_sms=sms,
+                ),
+                combine_sms,
+                run_shared=run_nvfp4_shared_mlp,
+            )
+
         validation_groups = pipeline_specs[max(pipeline_specs)]
         for _, _, row_start, row_count in validation_groups:
             dispatch_mxfp4_range(row_start, row_count)
@@ -1872,6 +2012,18 @@ def main() -> None:
             pipelined_nvfp4[1][:num_tokens // 128],
             actual_nvfp4[1][:num_tokens // 128],
         )
+        for pull_cols in nvfp4_pull_cols_sweep:
+            dispatch_nvfp4_range(0, num_tokens, pull_cols=pull_cols)
+            _assert_exact(
+                f"NVFP4 {pull_cols}-column dispatch data",
+                _as_bytes(pipelined_nvfp4[0])[:num_tokens],
+                _as_bytes(actual_nvfp4[0])[:num_tokens],
+            )
+            _assert_exact(
+                f"NVFP4 {pull_cols}-column dispatch scales",
+                pipelined_nvfp4[1][:num_tokens // 128],
+                actual_nvfp4[1][:num_tokens // 128],
+            )
 
         actual_nvfp4_views = nvfp4_activation_views(actual_nvfp4)
         run_mxfp4_gate_up(actual_mxfp4)
@@ -1992,6 +2144,36 @@ def main() -> None:
             hidden_nvfp4_row[4],
             hidden_nvfp4_rowcol[4],
         )
+        hidden_nvfp4_constant = nvfp4_quant.tk_silu_quantize_for_gemm(
+            gate_up_nvfp4,
+            args.expert_hidden,
+            False,
+            True,
+        )
+        nvfp4_quant.tk_silu_quantize_for_gemm_constant_scale_into(
+            gate_up_nvfp4,
+            args.expert_hidden,
+            cached_hidden_nvfp4[0],
+            cached_hidden_nvfp4[1],
+            cached_hidden_nvfp4[2],
+            cached_hidden_nvfp4_sync,
+        )
+        _assert_exact(
+            "NVFP4 cached constant-scale SwiGLU data",
+            _as_bytes(cached_hidden_nvfp4[0]),
+            _as_bytes(hidden_nvfp4_constant[0]),
+        )
+        _assert_exact(
+            "NVFP4 cached constant-scale SwiGLU scales",
+            cached_hidden_nvfp4[1],
+            hidden_nvfp4_constant[1],
+        )
+        _assert_exact(
+            "NVFP4 cached constant-scale SwiGLU global scale",
+            cached_hidden_nvfp4[2],
+            hidden_nvfp4_constant[4],
+        )
+        del hidden_nvfp4_constant
         run_mxfp4_routed_mlp(actual_mxfp4)
         run_nvfp4_routed_mlp(actual_nvfp4)
         mxfp4_routed_sample = routed_mxfp4[gemm_sample_rows].clone()
@@ -2067,6 +2249,12 @@ def main() -> None:
                     f"{streamed_rms}"
                 )
             pipeline_relative_rms[group_count] = streamed_rms
+            run_nvfp4_cached_streamed(group_count)
+            _assert_exact(
+                f"NVFP4 {group_count}-group cached streamed routed MLP",
+                routed_nvfp4[gemm_sample_rows],
+                nvfp4_constant_routed_sample,
+            )
 
         combine_sample_count = min(64, workspace.num_local_tokens * workspace.topk)
         combine_sample_routes = (
@@ -2165,6 +2353,16 @@ def main() -> None:
         run_nvfp4_streamed(combine_validation_groups, push_output=True)
         _assert_exact(
             "NVFP4 streamed push combine",
+            workspace.combine_buffer[combine_sample_routes],
+            expected_combine_samples(routed_nvfp4),
+        )
+        workspace.combine_buffer.fill_(float("nan"))
+        dist.barrier(async_op=True).block_current_stream()
+        run_nvfp4_cached_streamed(
+            combine_validation_groups, push_output=True
+        )
+        _assert_exact(
+            "NVFP4 cached streamed push combine",
             workspace.combine_buffer[combine_sample_routes],
             expected_combine_samples(routed_nvfp4),
         )
@@ -2430,6 +2628,17 @@ def main() -> None:
                         True,
                     ),
                 ),
+                (
+                    "NVFP4 cached routed SwiGLU quant",
+                    lambda: nvfp4_quant.tk_silu_quantize_for_gemm_constant_scale_into(
+                        gate_up_nvfp4,
+                        args.expert_hidden,
+                        cached_hidden_nvfp4[0],
+                        cached_hidden_nvfp4[1],
+                        cached_hidden_nvfp4[2],
+                        cached_hidden_nvfp4_sync,
+                    ),
+                ),
             )
         )
 
@@ -2452,6 +2661,17 @@ def main() -> None:
                             args.combine_sms,
                             None,
                             tokens_per_cta,
+                        ),
+                    ),
+                    (
+                        f"NVFP4 full MoE all-FP4 epilogue {tokens_per_cta} tokens/CTA",
+                        lambda tokens_per_cta=tokens_per_cta: run_nvfp4_full_moe(
+                            epilogue_tokens_per_cta=tokens_per_cta,
+                            launch_shared_early=True,
+                            use_constant_scale=True,
+                            use_cached_gate=True,
+                            use_cached_down=True,
+                            use_nvfp4_shared=True,
                         ),
                     ),
                 )
@@ -2477,6 +2697,17 @@ def main() -> None:
                             None,
                             args.epilogue_tokens_per_cta,
                             cols_per_cta,
+                        ),
+                    ),
+                    (
+                        f"NVFP4 full MoE all-FP4 epilogue {cols_per_cta} columns/CTA",
+                        lambda cols_per_cta=cols_per_cta: run_nvfp4_full_moe(
+                            epilogue_cols_per_cta=cols_per_cta,
+                            launch_shared_early=True,
+                            use_constant_scale=True,
+                            use_cached_gate=True,
+                            use_cached_down=True,
+                            use_nvfp4_shared=True,
                         ),
                     ),
                 )
@@ -2593,6 +2824,13 @@ def main() -> None:
                             group_count
                         ),
                     ),
+                    (
+                        f"NVFP4 cached streamed MLP ({group_count} groups, "
+                        f"{args.comm_sms}/{overlap_comm_sms} SM)",
+                        lambda group_count=group_count: run_nvfp4_cached_streamed(
+                            group_count
+                        ),
+                    ),
                 )
             )
         for pull_cols in mxfp4_pull_cols_sweep:
@@ -2601,6 +2839,15 @@ def main() -> None:
                     f"MXFP4 full MoE pull-cols {pull_cols}",
                     lambda pull_cols=pull_cols: run_mxfp4_full_moe(
                         args.combine_sms, pull_cols
+                    ),
+                )
+            )
+        for pull_cols in nvfp4_pull_cols_sweep:
+            gemm_variants.append(
+                (
+                    f"NVFP4 pull+quant-cols {pull_cols}",
+                    lambda pull_cols=pull_cols: dispatch_nvfp4_range(
+                        0, num_tokens, pull_cols=pull_cols
                     ),
                 )
             )
@@ -2619,6 +2866,17 @@ def main() -> None:
                         f"MXFP4 full MoE combine-cols {combine_cols}",
                         lambda combine_cols=combine_cols: run_mxfp4_full_moe(
                             combine_cols=combine_cols
+                        ),
+                    ),
+                    (
+                        f"NVFP4 full MoE all-FP4 combine-cols {combine_cols}",
+                        lambda combine_cols=combine_cols: run_nvfp4_full_moe(
+                            combine_cols=combine_cols,
+                            launch_shared_early=True,
+                            use_constant_scale=True,
+                            use_cached_gate=True,
+                            use_cached_down=True,
+                            use_nvfp4_shared=True,
                         ),
                     ),
                 )
@@ -2732,6 +2990,27 @@ def main() -> None:
                                     group_count,
                                     push_output=True,
                                     combine_sms=combine_sms,
+                                )
+                            ),
+                        ),
+                        (
+                            f"NVFP4 cached streamed MLP + push ({group_count} groups, "
+                            f"{args.comm_sms}/{overlap_comm_sms}/{combine_sms} SM)",
+                            lambda group_count=group_count, combine_sms=combine_sms: (
+                                run_nvfp4_cached_streamed(
+                                    group_count,
+                                    push_output=True,
+                                    combine_sms=combine_sms,
+                                )
+                            ),
+                        ),
+                        (
+                            f"NVFP4 full MoE all-FP4 streamed ({group_count} groups, "
+                            f"{args.comm_sms}/{overlap_comm_sms}/{combine_sms} SM)",
+                            lambda group_count=group_count, combine_sms=combine_sms: (
+                                run_nvfp4_cached_streamed_full_moe(
+                                    group_count,
+                                    combine_sms,
                                 )
                             ),
                         ),
