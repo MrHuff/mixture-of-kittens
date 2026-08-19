@@ -102,6 +102,11 @@ def _parse_args() -> argparse.Namespace:
         help="optional comma-separated MXFP4 batched-GEMM config IDs",
     )
     parser.add_argument(
+        "--sweep-nvfp4-gemm-configs",
+        default="",
+        help="optional comma-separated NVFP4 pitched batched-GEMM config IDs",
+    )
+    parser.add_argument(
         "--mxfp4-pull-cols",
         type=int,
         choices=(0, 512, 640, 768, 896),
@@ -252,6 +257,22 @@ def _mxfp4_gemm_config_sweep(args: argparse.Namespace) -> list[int]:
         ) from error
     if any(value < 0 or value > 9 for value in values):
         raise ValueError("MXFP4 batched-GEMM config IDs must be in [0, 9]")
+    return list(dict.fromkeys(values))
+
+
+def _nvfp4_gemm_config_sweep(args: argparse.Namespace) -> list[int]:
+    if not args.sweep_nvfp4_gemm_configs:
+        return []
+    try:
+        values = [
+            int(value) for value in args.sweep_nvfp4_gemm_configs.split(",")
+        ]
+    except ValueError as error:
+        raise ValueError(
+            "--sweep-nvfp4-gemm-configs must be comma-separated integers"
+        ) from error
+    if any(value < 0 or value > 12 for value in values):
+        raise ValueError("NVFP4 pitched batched-GEMM config IDs must be in [0, 12]")
     return list(dict.fromkeys(values))
 
 
@@ -507,6 +528,7 @@ def main() -> None:
     combine_sms_sweep = _combine_sms_sweep(args)
     combine_cols_sweep = _combine_cols_sweep(args)
     mxfp4_gemm_config_sweep = _mxfp4_gemm_config_sweep(args)
+    nvfp4_gemm_config_sweep = _nvfp4_gemm_config_sweep(args)
     mxfp4_pull_cols_sweep = _mxfp4_pull_cols_sweep(args)
     epilogue_tokens_per_cta_sweep = _epilogue_tokens_per_cta_sweep(args)
     epilogue_cols_per_cta_sweep = _epilogue_cols_per_cta_sweep(args)
@@ -681,6 +703,11 @@ def main() -> None:
     gemm_variants: list[tuple[str, Callable[[], object]]] = []
     gemm_relative_rms: tuple[float, float] | None = None
     routed_mlp_relative_rms: tuple[float, float] | None = None
+    mxfp4_shared_mlp_relative_rms: float | None = None
+    mxfp4_shared_full_moe_relative_rms: float | None = None
+    nvfp4_shared_mlp_relative_rms: float | None = None
+    nvfp4_shared_full_moe_relative_rms: float | None = None
+    nvfp4_constant_routed_mlp_relative_rms: float | None = None
     bf16_routed_mlp_relative_rms: float | None = None
     pipeline_relative_rms: dict[int, tuple[float, float]] = {}
     full_moe_relative_rms: tuple[float, float] | None = None
@@ -757,6 +784,115 @@ def main() -> None:
             device=device,
             generator=shared_weight_generator,
         ) * 0.02
+        shared_gate_up_mxfp4_weights = mxfp4_quant.mxfp4_quantize_for_gemm(
+            shared_gate_up_weights, 1
+        )
+        shared_down_mxfp4_weights = mxfp4_quant.mxfp4_quantize_for_gemm(
+            shared_down_weights, 1
+        )
+        shared_x_mxfp4 = mxfp4_quant.mxfp4_quantize_for_gemm(x, 1)
+        shared_gate_up_mxfp4 = torch.empty(
+            args.tokens,
+            gate_up_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        shared_hidden_mxfp4 = torch.empty(
+            args.tokens,
+            args.expert_hidden // 2,
+            dtype=torch.float4_e2m1fn_x2,
+            device=device,
+        )
+        shared_hidden_mxfp4_scales = torch.empty(
+            args.tokens // 128,
+            args.expert_hidden // 128,
+            32,
+            16,
+            dtype=torch.uint8,
+            device=device,
+        )
+        shared_output_mxfp4 = torch.empty(
+            args.tokens,
+            args.hidden,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        shared_mxfp4_gate_plan = mxfp4_gemm.MXFP4GemmPlan(
+            shared_x_mxfp4[0],
+            shared_x_mxfp4[1],
+            shared_gate_up_mxfp4_weights[0],
+            shared_gate_up_mxfp4_weights[1],
+            shared_gate_up_mxfp4,
+        )
+        shared_mxfp4_down_plan = mxfp4_gemm.MXFP4GemmPlan(
+            shared_hidden_mxfp4,
+            shared_hidden_mxfp4_scales,
+            shared_down_mxfp4_weights[0],
+            shared_down_mxfp4_weights[1],
+            shared_output_mxfp4,
+        )
+        shared_gate_up_nvfp4_weights = nvfp4_quant.tk_quantize_for_gemm(
+            shared_gate_up_weights, False, True
+        )
+        shared_down_nvfp4_weights = nvfp4_quant.tk_quantize_for_gemm(
+            shared_down_weights, False, True
+        )
+        shared_x_nvfp4 = (
+            torch.empty(
+                args.tokens,
+                args.hidden // 2,
+                dtype=torch.float4_e2m1fn_x2,
+                device=device,
+            ),
+            torch.empty(
+                args.tokens // 128,
+                args.hidden // 64,
+                512,
+                dtype=torch.float8_e4m3fn,
+                device=device,
+            ),
+            torch.empty(1, dtype=torch.float32, device=device),
+        )
+        shared_x_nvfp4_sync = torch.empty(1, dtype=torch.int32, device=device)
+        shared_gate_up_nvfp4 = torch.empty_like(shared_gate_up_mxfp4)
+        shared_hidden_nvfp4 = (
+            torch.empty(
+                args.tokens,
+                args.expert_hidden // 2,
+                dtype=torch.float4_e2m1fn_x2,
+                device=device,
+            ),
+            torch.empty(
+                args.tokens // 128,
+                args.expert_hidden // 64,
+                512,
+                dtype=torch.float8_e4m3fn,
+                device=device,
+            ),
+            torch.empty(1, dtype=torch.float32, device=device),
+        )
+        shared_hidden_nvfp4_sync = torch.empty(
+            1, dtype=torch.int32, device=device
+        )
+        shared_output_nvfp4 = torch.empty_like(shared_output_mxfp4)
+        shared_nvfp4_gate_plan = nvfp4_gemm.NVFP4BatchedGemmPlan(
+            [shared_x_nvfp4[0]],
+            [shared_x_nvfp4[1]],
+            [shared_x_nvfp4[2]],
+            [shared_gate_up_nvfp4_weights[0]],
+            [shared_gate_up_nvfp4_weights[1]],
+            [shared_gate_up_nvfp4_weights[4]],
+            [shared_gate_up_nvfp4],
+        )
+        shared_nvfp4_down_plan = nvfp4_gemm.NVFP4BatchedGemmPlan(
+            [shared_hidden_nvfp4[0]],
+            [shared_hidden_nvfp4[1]],
+            [shared_hidden_nvfp4[2]],
+            [shared_down_nvfp4_weights[0]],
+            [shared_down_nvfp4_weights[1]],
+            [shared_down_nvfp4_weights[4]],
+            [shared_output_nvfp4],
+        )
         shared_gate_weights = shared_gate_up_weights[
             :args.expert_hidden
         ].contiguous()
@@ -911,7 +1047,17 @@ def main() -> None:
             ] | None = None,
             expert_begin: int = 0,
             expert_end: int | None = None,
+            config_id: int = -1,
+            flatten_batches: bool = False,
+            cached_plan: object | None = None,
         ) -> torch.Tensor:
+            if cached_plan is not None:
+                if expert_begin != 0 or (
+                    expert_end is not None and expert_end != len(active_experts)
+                ):
+                    raise ValueError("cached NVFP4 plan requires the full expert range")
+                cached_plan.run()
+                return gate_up_nvfp4
             if activation_views is None:
                 activation_views = nvfp4_activation_views(quantized)
             if expert_end is None:
@@ -928,7 +1074,7 @@ def main() -> None:
                     expert_end,
                 )
                 batch = slice(batch_start, batch_end)
-                nvfp4_gemm.nvfp4_batched_gemm(
+                operands = (
                     activation_fp4[batch],
                     activation_scales[batch],
                     activation_global_scales[batch],
@@ -937,6 +1083,14 @@ def main() -> None:
                     nv_weight_global_scales[batch],
                     nv_outputs[batch],
                 )
+                if config_id < 0:
+                    nvfp4_gemm.nvfp4_batched_gemm(*operands)
+                else:
+                    nvfp4_gemm.nvfp4_batched_gemm_pitched(
+                        *operands,
+                        flatten_batches,
+                        config_id,
+                    )
             return gate_up_nvfp4
 
         down_weight_starts = [
@@ -1009,6 +1163,8 @@ def main() -> None:
             expert_begin: int = 0,
             expert_end: int | None = None,
             row_base: int = 0,
+            config_id: int = -1,
+            flatten_batches: bool = False,
         ) -> torch.Tensor:
             if expert_end is None:
                 expert_end = len(active_experts)
@@ -1036,7 +1192,7 @@ def main() -> None:
                 )
                 batch = slice(batch_start - expert_begin, batch_end - expert_begin)
                 output_batch = slice(batch_start, batch_end)
-                nvfp4_gemm.nvfp4_batched_gemm(
+                operands = (
                     activation_fp4[batch],
                     activation_scales[batch],
                     activation_global_scales[batch],
@@ -1045,6 +1201,14 @@ def main() -> None:
                     nv_down_weight_global_scales[output_batch],
                     nv_down_outputs[output_batch],
                 )
+                if config_id < 0:
+                    nvfp4_gemm.nvfp4_batched_gemm(*operands)
+                else:
+                    nvfp4_gemm.nvfp4_batched_gemm_pitched(
+                        *operands,
+                        flatten_batches,
+                        config_id,
+                    )
             return routed_nvfp4
 
         def run_mxfp4_routed_mlp(
@@ -1084,6 +1248,9 @@ def main() -> None:
             expert_end: int | None = None,
             row_start: int = 0,
             row_count: int | None = None,
+            use_constant_scale: bool = False,
+            cached_gate_plan: object | None = None,
+            cached_down_plan: object | None = None,
         ) -> torch.Tensor:
             if expert_end is None:
                 expert_end = len(active_experts)
@@ -1093,9 +1260,28 @@ def main() -> None:
                 quantized,
                 expert_begin=expert_begin,
                 expert_end=expert_end,
+                cached_plan=cached_gate_plan,
             )
+            if cached_down_plan is not None:
+                if expert_begin != 0 or expert_end != len(active_experts):
+                    raise ValueError(
+                        "cached NVFP4 down plan requires the full expert range"
+                    )
+                nvfp4_quant.tk_silu_quantize_for_gemm_constant_scale_into(
+                    gate_up_nvfp4.narrow(0, row_start, row_count),
+                    args.expert_hidden,
+                    cached_hidden_nvfp4[0],
+                    cached_hidden_nvfp4[1],
+                    cached_hidden_nvfp4[2],
+                    cached_hidden_nvfp4_sync,
+                )
+                cached_down_plan.run()
+                return routed_nvfp4
             hidden_quantized = nvfp4_quant.tk_silu_quantize_for_gemm(
-                gate_up_nvfp4.narrow(0, row_start, row_count), args.expert_hidden
+                gate_up_nvfp4.narrow(0, row_start, row_count),
+                args.expert_hidden,
+                False,
+                use_constant_scale,
             )
             return run_nvfp4_down(
                 hidden_quantized, expert_begin, expert_end, row_start
@@ -1118,6 +1304,108 @@ def main() -> None:
                 * gate_up[:, args.expert_hidden:]
             )
             return F.linear(hidden, shared_down_weights)
+
+        def run_mxfp4_shared_mlp() -> torch.Tensor:
+            mxfp4_quant.mxfp4_quantize_for_gemm_launch_inplace(
+                x,
+                shared_x_mxfp4[0],
+                shared_x_mxfp4[1],
+                1,
+            )
+            shared_mxfp4_gate_plan.run()
+            mxfp4_quant.mxfp4_fused_silu_mul_quantize_row_strided_launch_inplace(
+                shared_gate_up_mxfp4,
+                args.expert_hidden,
+                args.expert_hidden,
+                shared_hidden_mxfp4,
+                shared_hidden_mxfp4_scales,
+                1,
+            )
+            shared_mxfp4_down_plan.run()
+            return shared_output_mxfp4
+
+        def run_nvfp4_shared_mlp() -> torch.Tensor:
+            nvfp4_quant.tk_quantize_for_gemm_constant_scale_into(
+                x,
+                shared_x_nvfp4[0],
+                shared_x_nvfp4[1],
+                shared_x_nvfp4[2],
+                shared_x_nvfp4_sync,
+            )
+            shared_nvfp4_gate_plan.run()
+            nvfp4_quant.tk_silu_quantize_for_gemm_constant_scale_into(
+                shared_gate_up_nvfp4,
+                args.expert_hidden,
+                shared_hidden_nvfp4[0],
+                shared_hidden_nvfp4[1],
+                shared_hidden_nvfp4[2],
+                shared_hidden_nvfp4_sync,
+            )
+            shared_nvfp4_down_plan.run()
+            return shared_output_nvfp4
+
+        shared_x_mxfp4_reference = mxfp4_quant.mxfp4_quantize_for_gemm(x, 1)
+        mxfp4_quant.mxfp4_quantize_for_gemm_launch_inplace(
+            x,
+            shared_x_mxfp4[0],
+            shared_x_mxfp4[1],
+            1,
+        )
+        _assert_exact(
+            "MXFP4 in-place input quant data",
+            _as_bytes(shared_x_mxfp4[0]),
+            _as_bytes(shared_x_mxfp4_reference[0]),
+        )
+        _assert_exact(
+            "MXFP4 in-place input quant scales",
+            shared_x_mxfp4[1],
+            shared_x_mxfp4_reference[1],
+        )
+        mxfp4_gemm.mxfp4_gemm(
+            shared_x_mxfp4[0],
+            shared_x_mxfp4[1],
+            shared_gate_up_mxfp4_weights[0],
+            shared_gate_up_mxfp4_weights[1],
+            shared_gate_up_mxfp4,
+        )
+        shared_gate_sample = shared_gate_up_mxfp4[:128].clone()
+        shared_mxfp4_gate_plan.run()
+        _assert_exact(
+            "MXFP4 cached shared gate plan",
+            shared_gate_up_mxfp4[:128],
+            shared_gate_sample,
+        )
+
+        shared_x_nvfp4_reference = (
+            nvfp4_quant.tk_quantize_for_gemm_constant_scale(x, False)
+        )
+        nvfp4_quant.tk_quantize_for_gemm_constant_scale_into(
+            x,
+            shared_x_nvfp4[0],
+            shared_x_nvfp4[1],
+            shared_x_nvfp4[2],
+            shared_x_nvfp4_sync,
+        )
+        _assert_exact(
+            "NVFP4 in-place input quant data",
+            _as_bytes(shared_x_nvfp4[0]),
+            _as_bytes(shared_x_nvfp4_reference[0]),
+        )
+        _assert_exact(
+            "NVFP4 in-place input quant scales",
+            shared_x_nvfp4[1],
+            shared_x_nvfp4_reference[1],
+        )
+        _assert_exact(
+            "NVFP4 in-place input global scale",
+            shared_x_nvfp4[2],
+            shared_x_nvfp4_reference[4],
+        )
+        del (
+            shared_x_mxfp4_reference,
+            shared_gate_sample,
+            shared_x_nvfp4_reference,
+        )
 
         def run_bf16_mok_forward() -> torch.Tensor:
             output, _ = functional.forward(
@@ -1158,6 +1446,52 @@ def main() -> None:
         pipelined_nvfp4 = (
             torch.empty_like(actual_nvfp4[0]),
             torch.empty_like(actual_nvfp4[1]),
+        )
+        pipelined_nvfp4_views = nvfp4_activation_views(pipelined_nvfp4)
+        pipelined_nvfp4_gate_plan = nvfp4_gemm.NVFP4BatchedGemmPlan(
+            pipelined_nvfp4_views[0],
+            pipelined_nvfp4_views[1],
+            [nvfp4_global_scale for _ in active_experts],
+            nv_weight_fp4,
+            nv_weight_scales,
+            nv_weight_global_scales,
+            nv_outputs,
+        )
+        cached_hidden_nvfp4 = (
+            torch.empty(
+                num_tokens,
+                args.expert_hidden // 2,
+                dtype=torch.float4_e2m1fn_x2,
+                device=device,
+            ),
+            torch.empty(
+                num_tokens // 128,
+                args.expert_hidden // 64,
+                512,
+                dtype=torch.float8_e4m3fn,
+                device=device,
+            ),
+            torch.empty(1, dtype=torch.float32, device=device),
+        )
+        cached_hidden_nvfp4_sync = torch.empty(
+            1, dtype=torch.int32, device=device
+        )
+        cached_hidden_activation_fp4 = [
+            cached_hidden_nvfp4[0].narrow(0, start, rows)
+            for start, rows in zip(active_starts, active_rows, strict=True)
+        ]
+        cached_hidden_activation_scales = [
+            cached_hidden_nvfp4[1].narrow(0, start // 128, rows // 128)
+            for start, rows in zip(active_starts, active_rows, strict=True)
+        ]
+        cached_nvfp4_down_plan = nvfp4_gemm.NVFP4BatchedGemmPlan(
+            cached_hidden_activation_fp4,
+            cached_hidden_activation_scales,
+            [cached_hidden_nvfp4[2] for _ in active_experts],
+            nv_down_weight_fp4,
+            nv_down_weight_scales,
+            nv_down_weight_global_scales,
+            nv_down_outputs,
         )
         comm_stream = torch.cuda.Stream(device=device)
         combine_stream = torch.cuda.Stream(device=device)
@@ -1266,9 +1600,22 @@ def main() -> None:
             dispatch_mxfp4_range(0, num_tokens, pull_cols=pull_cols)
             return run_mxfp4_routed_mlp(pipelined_mxfp4)
 
-        def run_nvfp4_serial_into() -> torch.Tensor:
+        def run_nvfp4_serial_into(
+            use_constant_scale: bool = False,
+            use_cached_gate: bool = False,
+            use_cached_down: bool = False,
+        ) -> torch.Tensor:
             dispatch_nvfp4_range(0, num_tokens)
-            return run_nvfp4_routed_mlp(pipelined_nvfp4)
+            return run_nvfp4_routed_mlp(
+                pipelined_nvfp4,
+                use_constant_scale=use_constant_scale,
+                cached_gate_plan=(
+                    pipelined_nvfp4_gate_plan if use_cached_gate else None
+                ),
+                cached_down_plan=(
+                    cached_nvfp4_down_plan if use_cached_down else None
+                ),
+            )
 
         def run_combine_only(
             routed_output: torch.Tensor,
@@ -1291,8 +1638,15 @@ def main() -> None:
         def run_nvfp4_serial_with_combine(
             combine_sms: int = args.combine_sms,
             combine_cols: int = args.combine_cols,
+            use_constant_scale: bool = False,
+            use_cached_gate: bool = False,
+            use_cached_down: bool = False,
         ) -> torch.Tensor:
-            run_nvfp4_serial_into()
+            run_nvfp4_serial_into(
+                use_constant_scale,
+                use_cached_gate,
+                use_cached_down,
+            )
             return run_combine_only(routed_nvfp4, combine_sms, combine_cols)
 
         def run_mxfp4_streamed(
@@ -1397,12 +1751,13 @@ def main() -> None:
             launch_shared_early: bool = True,
             epilogue_tokens_per_cta: int = args.epilogue_tokens_per_cta,
             epilogue_cols_per_cta: int = args.epilogue_cols_per_cta,
+            run_shared: Callable[[], torch.Tensor] = run_bf16_shared_mlp,
         ) -> torch.Tensor:
             current_stream = torch.cuda.current_stream(device)
             if launch_shared_early:
                 shared_stream.wait_stream(current_stream)
                 with torch.cuda.stream(shared_stream):
-                    shared_output = run_bf16_shared_mlp()
+                    shared_output = run_shared()
                     shared_done.record()
             workspace.x_buffer.copy_(x)
             ops.barrier_all(
@@ -1414,7 +1769,7 @@ def main() -> None:
             if not launch_shared_early:
                 shared_stream.wait_stream(current_stream)
                 with torch.cuda.stream(shared_stream):
-                    shared_output = run_bf16_shared_mlp()
+                    shared_output = run_shared()
                     shared_done.record()
             run_routed(combine_sms)
             current_stream.wait_event(shared_done)
@@ -1432,6 +1787,7 @@ def main() -> None:
             epilogue_tokens_per_cta: int = args.epilogue_tokens_per_cta,
             epilogue_cols_per_cta: int = args.epilogue_cols_per_cta,
             combine_cols: int = args.combine_cols,
+            use_mxfp4_shared: bool = False,
         ) -> torch.Tensor:
             return run_full_moe(
                 lambda sms: run_mxfp4_serial_with_combine(
@@ -1440,6 +1796,11 @@ def main() -> None:
                 combine_sms,
                 epilogue_tokens_per_cta=epilogue_tokens_per_cta,
                 epilogue_cols_per_cta=epilogue_cols_per_cta,
+                run_shared=(
+                    run_mxfp4_shared_mlp
+                    if use_mxfp4_shared
+                    else run_bf16_shared_mlp
+                ),
             )
 
         def run_nvfp4_full_moe(
@@ -1447,13 +1808,29 @@ def main() -> None:
             epilogue_tokens_per_cta: int = args.epilogue_tokens_per_cta,
             epilogue_cols_per_cta: int = args.epilogue_cols_per_cta,
             combine_cols: int = args.combine_cols,
+            launch_shared_early: bool = False,
+            use_constant_scale: bool = False,
+            use_cached_gate: bool = False,
+            use_cached_down: bool = False,
+            use_nvfp4_shared: bool = False,
         ) -> torch.Tensor:
             return run_full_moe(
-                lambda sms: run_nvfp4_serial_with_combine(sms, combine_cols),
+                lambda sms: run_nvfp4_serial_with_combine(
+                    sms,
+                    combine_cols,
+                    use_constant_scale,
+                    use_cached_gate,
+                    use_cached_down,
+                ),
                 combine_sms,
-                launch_shared_early=False,
+                launch_shared_early=launch_shared_early,
                 epilogue_tokens_per_cta=epilogue_tokens_per_cta,
                 epilogue_cols_per_cta=epilogue_cols_per_cta,
+                run_shared=(
+                    run_nvfp4_shared_mlp
+                    if use_nvfp4_shared
+                    else run_bf16_shared_mlp
+                ),
             )
 
         validation_groups = pipeline_specs[max(pipeline_specs)]
@@ -1558,6 +1935,16 @@ def main() -> None:
         _assert_exact(
             "NVFP4 gate/up repeat", gate_up_nvfp4[gemm_sample_rows], nvfp4_sample
         )
+        dispatch_nvfp4_range(0, num_tokens)
+        run_nvfp4_gate_up(
+            pipelined_nvfp4,
+            cached_plan=pipelined_nvfp4_gate_plan,
+        )
+        _assert_exact(
+            "NVFP4 cached-plan gate/up",
+            gate_up_nvfp4[gemm_sample_rows],
+            nvfp4_sample,
+        )
         hidden_mxfp4_rowcol = (
             mxfp4_quant.mxfp4_fused_silu_mul_quantize_row_and_col_strided(
                 gate_up_mxfp4,
@@ -1584,6 +1971,27 @@ def main() -> None:
             hidden_mxfp4_row[1],
             hidden_mxfp4_rowcol[1],
         )
+        hidden_nvfp4_rowcol = nvfp4_quant.tk_silu_quantize_for_gemm(
+            gate_up_nvfp4, args.expert_hidden, True
+        )
+        hidden_nvfp4_row = nvfp4_quant.tk_silu_quantize_for_gemm(
+            gate_up_nvfp4, args.expert_hidden, False
+        )
+        _assert_exact(
+            "NVFP4 row-only fused SwiGLU data",
+            _as_bytes(hidden_nvfp4_row[0]),
+            _as_bytes(hidden_nvfp4_rowcol[0]),
+        )
+        _assert_exact(
+            "NVFP4 row-only fused SwiGLU scales",
+            hidden_nvfp4_row[1],
+            hidden_nvfp4_rowcol[1],
+        )
+        _assert_exact(
+            "NVFP4 row-only fused SwiGLU global scale",
+            hidden_nvfp4_row[4],
+            hidden_nvfp4_rowcol[4],
+        )
         run_mxfp4_routed_mlp(actual_mxfp4)
         run_nvfp4_routed_mlp(actual_nvfp4)
         mxfp4_routed_sample = routed_mxfp4[gemm_sample_rows].clone()
@@ -1597,6 +2005,27 @@ def main() -> None:
                 "FP4 routed MLP relative RMS error too large: "
                 f"{routed_mlp_relative_rms}"
             )
+        run_nvfp4_routed_mlp(actual_nvfp4, use_constant_scale=True)
+        nvfp4_constant_routed_sample = routed_nvfp4[gemm_sample_rows].clone()
+        nvfp4_constant_routed_mlp_relative_rms = _relative_rms(
+            nvfp4_constant_routed_sample,
+            routed_mlp_expected,
+        )
+        if nvfp4_constant_routed_mlp_relative_rms >= 0.7:
+            raise AssertionError(
+                "NVFP4 constant-scale routed MLP relative RMS error too large: "
+                f"{nvfp4_constant_routed_mlp_relative_rms}"
+            )
+        run_nvfp4_routed_mlp(
+            actual_nvfp4,
+            use_constant_scale=True,
+            cached_down_plan=cached_nvfp4_down_plan,
+        )
+        _assert_exact(
+            "NVFP4 cached-plan down",
+            routed_nvfp4[gemm_sample_rows],
+            nvfp4_constant_routed_sample,
+        )
         bf16_routed_sample = run_bf16_routed_mlp()[gemm_sample_rows].clone()
         bf16_routed_mlp_relative_rms = _relative_rms(
             bf16_routed_sample, routed_mlp_expected
@@ -1753,6 +2182,25 @@ def main() -> None:
                 ).sum(dim=1)
             ).to(torch.bfloat16)
 
+        mxfp4_shared_output = run_mxfp4_shared_mlp()
+        mxfp4_shared_mlp_relative_rms = _relative_rms(
+            mxfp4_shared_output, run_bf16_shared_mlp()
+        )
+        if mxfp4_shared_mlp_relative_rms >= 0.7:
+            raise AssertionError(
+                "MXFP4 shared MLP relative RMS error too large: "
+                f"{mxfp4_shared_mlp_relative_rms}"
+            )
+        nvfp4_shared_output = run_nvfp4_shared_mlp()
+        nvfp4_shared_mlp_relative_rms = _relative_rms(
+            nvfp4_shared_output, run_bf16_shared_mlp()
+        )
+        if nvfp4_shared_mlp_relative_rms >= 0.7:
+            raise AssertionError(
+                "NVFP4 shared MLP relative RMS error too large: "
+                f"{nvfp4_shared_mlp_relative_rms}"
+            )
+
         mxfp4_full_output = run_mxfp4_full_moe()
         mxfp4_full_rms = _relative_rms(
             mxfp4_full_output, full_moe_reference()
@@ -1766,6 +2214,32 @@ def main() -> None:
             raise AssertionError(
                 "FP4 full MoE assembly relative RMS error too large: "
                 f"{full_moe_relative_rms}"
+            )
+        mxfp4_shared_full_output = run_mxfp4_full_moe(
+            use_mxfp4_shared=True
+        )
+        mxfp4_shared_full_moe_relative_rms = _relative_rms(
+            mxfp4_shared_full_output, full_moe_reference()
+        )
+        if mxfp4_shared_full_moe_relative_rms >= 0.7:
+            raise AssertionError(
+                "MXFP4 shared full-MoE relative RMS error too large: "
+                f"{mxfp4_shared_full_moe_relative_rms}"
+            )
+        nvfp4_shared_full_output = run_nvfp4_full_moe(
+            launch_shared_early=True,
+            use_constant_scale=True,
+            use_cached_gate=True,
+            use_cached_down=True,
+            use_nvfp4_shared=True,
+        )
+        nvfp4_shared_full_moe_relative_rms = _relative_rms(
+            nvfp4_shared_full_output, full_moe_reference()
+        )
+        if nvfp4_shared_full_moe_relative_rms >= 0.7:
+            raise AssertionError(
+                "NVFP4 shared full-MoE relative RMS error too large: "
+                f"{nvfp4_shared_full_moe_relative_rms}"
             )
 
         epilogue_shared_output = run_bf16_shared_mlp()
@@ -1869,6 +2343,54 @@ def main() -> None:
                                 sweep_hidden_mxfp4, config_id=config_id
                             ),
                         ),
+                        (
+                            f"MXFP4 shared gate/up config {config_id}",
+                            lambda config_id=config_id: mxfp4_gemm.mxfp4_gemm_config(
+                                shared_x_mxfp4[0],
+                                shared_x_mxfp4[1],
+                                shared_gate_up_mxfp4_weights[0],
+                                shared_gate_up_mxfp4_weights[1],
+                                shared_gate_up_mxfp4,
+                                config_id,
+                            ),
+                        ),
+                        (
+                            f"MXFP4 shared down config {config_id}",
+                            lambda config_id=config_id: mxfp4_gemm.mxfp4_gemm_config(
+                                shared_hidden_mxfp4,
+                                shared_hidden_mxfp4_scales,
+                                shared_down_mxfp4_weights[0],
+                                shared_down_mxfp4_weights[1],
+                                shared_output_mxfp4,
+                                config_id,
+                            ),
+                        ),
+                    )
+                )
+
+        for config_id in nvfp4_gemm_config_sweep:
+            for flatten_batches in (False, True):
+                schedule_name = "flat" if flatten_batches else "z-grid"
+                gemm_variants.extend(
+                    (
+                        (
+                            f"NVFP4 pitched gate/up c{config_id} {schedule_name}",
+                            lambda config_id=config_id,
+                            flatten_batches=flatten_batches: run_nvfp4_gate_up(
+                                actual_nvfp4,
+                                config_id=config_id,
+                                flatten_batches=flatten_batches,
+                            ),
+                        ),
+                        (
+                            f"NVFP4 pitched down c{config_id} {schedule_name}",
+                            lambda config_id=config_id,
+                            flatten_batches=flatten_batches: run_nvfp4_down(
+                                hidden_nvfp4_row,
+                                config_id=config_id,
+                                flatten_batches=flatten_batches,
+                            ),
+                        ),
                     )
                 )
 
@@ -1882,6 +2404,31 @@ def main() -> None:
                     hidden_mxfp4,
                     hidden_mxfp4_scales,
                     1,
+                ),
+            )
+        )
+        gemm_variants.extend(
+            (
+                (
+                    "NVFP4 row+col SwiGLU quant",
+                    lambda: nvfp4_quant.tk_silu_quantize_for_gemm(
+                        gate_up_nvfp4, args.expert_hidden, True
+                    ),
+                ),
+                (
+                    "NVFP4 row-only SwiGLU quant",
+                    lambda: nvfp4_quant.tk_silu_quantize_for_gemm(
+                        gate_up_nvfp4, args.expert_hidden, False
+                    ),
+                ),
+                (
+                    "NVFP4 constant-scale SwiGLU quant",
+                    lambda: nvfp4_quant.tk_silu_quantize_for_gemm(
+                        gate_up_nvfp4,
+                        args.expert_hidden,
+                        False,
+                        True,
+                    ),
                 ),
             )
         )
@@ -1946,11 +2493,69 @@ def main() -> None:
                     run_mxfp8_mok_forward,
                 ),
                 ("BF16 routed expert MLP", run_bf16_routed_mlp),
+                ("BF16 shared expert MLP", run_bf16_shared_mlp),
+                ("MXFP4 shared expert MLP", run_mxfp4_shared_mlp),
+                (
+                    "MXFP4 shared input quant",
+                    lambda: mxfp4_quant.mxfp4_quantize_for_gemm_launch_inplace(
+                        x,
+                        shared_x_mxfp4[0],
+                        shared_x_mxfp4[1],
+                        1,
+                    ),
+                ),
+                (
+                    "MXFP4 shared gate/up GEMM",
+                    shared_mxfp4_gate_plan.run,
+                ),
+                (
+                    "MXFP4 shared SwiGLU quant",
+                    lambda: mxfp4_quant.mxfp4_fused_silu_mul_quantize_row_strided_launch_inplace(
+                        shared_gate_up_mxfp4,
+                        args.expert_hidden,
+                        args.expert_hidden,
+                        shared_hidden_mxfp4,
+                        shared_hidden_mxfp4_scales,
+                        1,
+                    ),
+                ),
+                (
+                    "MXFP4 shared down GEMM",
+                    shared_mxfp4_down_plan.run,
+                ),
+                ("NVFP4 shared expert MLP", run_nvfp4_shared_mlp),
+                (
+                    "NVFP4 shared input quant",
+                    lambda: nvfp4_quant.tk_quantize_for_gemm_constant_scale_into(
+                        x,
+                        shared_x_nvfp4[0],
+                        shared_x_nvfp4[1],
+                        shared_x_nvfp4[2],
+                        shared_x_nvfp4_sync,
+                    ),
+                ),
+                ("NVFP4 shared gate/up GEMM", shared_nvfp4_gate_plan.run),
+                (
+                    "NVFP4 shared SwiGLU quant",
+                    lambda: nvfp4_quant.tk_silu_quantize_for_gemm_constant_scale_into(
+                        shared_gate_up_nvfp4,
+                        args.expert_hidden,
+                        shared_hidden_nvfp4[0],
+                        shared_hidden_nvfp4[1],
+                        shared_hidden_nvfp4[2],
+                        shared_hidden_nvfp4_sync,
+                    ),
+                ),
+                ("NVFP4 shared down GEMM", shared_nvfp4_down_plan.run),
                 ("MXFP4 gate/up GEMM", lambda: run_mxfp4_gate_up(actual_mxfp4)),
                 ("MXFP4 dispatch + gate/up", run_mxfp4_pipeline),
                 (
                     "NVFP4 gate/up GEMM",
                     lambda: run_nvfp4_gate_up(actual_nvfp4, actual_nvfp4_views),
+                ),
+                (
+                    "NVFP4 cached gate/up GEMM",
+                    pipelined_nvfp4_gate_plan.run,
                 ),
                 ("NVFP4 dispatch + gate/up", run_nvfp4_pipeline),
                 (
@@ -2046,9 +2651,61 @@ def main() -> None:
                         ),
                     ),
                     (
+                        f"MXFP4 full MoE FP4 shared ({combine_sms} SM)",
+                        lambda combine_sms=combine_sms: run_mxfp4_full_moe(
+                            combine_sms,
+                            use_mxfp4_shared=True,
+                        ),
+                    ),
+                    (
                         f"NVFP4 full MoE forward ({combine_sms} SM)",
                         lambda combine_sms=combine_sms: (
                             run_nvfp4_full_moe(combine_sms)
+                        ),
+                    ),
+                    (
+                        f"NVFP4 full MoE shared-early ({combine_sms} SM)",
+                        lambda combine_sms=combine_sms: run_nvfp4_full_moe(
+                            combine_sms,
+                            launch_shared_early=True,
+                        ),
+                    ),
+                    (
+                        f"NVFP4 full MoE constant-scale ({combine_sms} SM)",
+                        lambda combine_sms=combine_sms: run_nvfp4_full_moe(
+                            combine_sms,
+                            launch_shared_early=True,
+                            use_constant_scale=True,
+                        ),
+                    ),
+                    (
+                        f"NVFP4 full MoE cached-gate ({combine_sms} SM)",
+                        lambda combine_sms=combine_sms: run_nvfp4_full_moe(
+                            combine_sms,
+                            launch_shared_early=True,
+                            use_constant_scale=True,
+                            use_cached_gate=True,
+                        ),
+                    ),
+                    (
+                        f"NVFP4 full MoE cached-plans ({combine_sms} SM)",
+                        lambda combine_sms=combine_sms: run_nvfp4_full_moe(
+                            combine_sms,
+                            launch_shared_early=True,
+                            use_constant_scale=True,
+                            use_cached_gate=True,
+                            use_cached_down=True,
+                        ),
+                    ),
+                    (
+                        f"NVFP4 full MoE all-FP4 ({combine_sms} SM)",
+                        lambda combine_sms=combine_sms: run_nvfp4_full_moe(
+                            combine_sms,
+                            launch_shared_early=True,
+                            use_constant_scale=True,
+                            use_cached_gate=True,
+                            use_cached_down=True,
+                            use_nvfp4_shared=True,
                         ),
                     ),
                 )
@@ -2182,10 +2839,25 @@ def main() -> None:
                 f"MXFP4={routed_mlp_relative_rms[0]:.4f}, "
                 f"NVFP4={routed_mlp_relative_rms[1]:.4f}"
             )
+        if nvfp4_constant_routed_mlp_relative_rms is not None:
+            print(
+                "NVFP4 constant-scale routed MLP relative RMS vs BF16: "
+                f"{nvfp4_constant_routed_mlp_relative_rms:.4f}"
+            )
         if bf16_routed_mlp_relative_rms is not None:
             print(
                 "BF16 routed MLP sampled relative RMS vs FP32 reference: "
                 f"{bf16_routed_mlp_relative_rms:.4f}"
+            )
+        if mxfp4_shared_mlp_relative_rms is not None:
+            print(
+                "MXFP4 shared MLP relative RMS vs BF16: "
+                f"{mxfp4_shared_mlp_relative_rms:.4f}"
+            )
+        if nvfp4_shared_mlp_relative_rms is not None:
+            print(
+                "NVFP4 shared MLP relative RMS vs BF16: "
+                f"{nvfp4_shared_mlp_relative_rms:.4f}"
             )
         for group_count, relative_rms in pipeline_relative_rms.items():
             print(
@@ -2203,6 +2875,16 @@ def main() -> None:
                 "Full MoE assembly relative RMS vs Torch epilogue: "
                 f"MXFP4={full_moe_relative_rms[0]:.6f}, "
                 f"NVFP4={full_moe_relative_rms[1]:.6f}"
+            )
+        if mxfp4_shared_full_moe_relative_rms is not None:
+            print(
+                "MXFP4-shared full MoE relative RMS vs BF16 shared: "
+                f"{mxfp4_shared_full_moe_relative_rms:.4f}"
+            )
+        if nvfp4_shared_full_moe_relative_rms is not None:
+            print(
+                "NVFP4-shared full MoE relative RMS vs BF16 shared: "
+                f"{nvfp4_shared_full_moe_relative_rms:.4f}"
             )
     if args.benchmark_filter:
         variants = [
